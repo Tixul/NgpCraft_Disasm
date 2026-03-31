@@ -1,0 +1,1499 @@
+#!/usr/bin/env python3
+"""
+ngpc_disasm.py — NGPC/NGP Disassembler
+Part of the NgpCraft open-source toolchain for Neo Geo Pocket Color.
+
+MIT License
+Copyright (c) 2026 NgpCraft contributors
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+Full TLCS-900/H decoder with NGPC memory map annotations.
+Handles both homebrew (NgpCraft toolchain) and CC900-compiled binaries.
+
+Usage:
+  python ngpc_disasm.py rom.ngc
+  python ngpc_disasm.py rom.ngc --base 0x200000
+  python ngpc_disasm.py rom.ngc --start 0x200040 --end 0x200200
+  python ngpc_disasm.py rom.ngc -o output.asm
+
+Sources: t900as.py (encoder), ngdis-master (reference C decoder),
+         HW_REGISTERS.md, BIOS_REF.md, ngpc_romtool.py, silicon notes.
+"""
+
+import sys, os, re, argparse
+
+ROM_BASE    = 0x200000
+HEADER_SIZE = 64
+
+# ============================================================
+# Register tables
+# ============================================================
+R8  = ['W',  'A',  'B',  'C',  'D',  'E',  'H',  'L' ]
+R16 = ['WA', 'BC', 'DE', 'HL', 'IX', 'IY', 'IZ', 'SP']
+R32 = ['XWA','XBC','XDE','XHL','XIX','XIY','XIZ','XSP']
+
+# Condition codes — cc index 0..15
+CC = ['F','LT','LE','ULE','OV','MI','Z','C',
+      'T','GE','GT','UGT','NOV','PL','NZ','NC']
+
+# ============================================================
+# NGPC hardware I/O register map (address → name)
+# ============================================================
+HW_IO = {
+    0x0020: 'HW_TRUN',      # Timer run control
+    0x0022: 'HW_TREG0',     # Timer 0 reload value
+    0x0023: 'HW_TREG1',     # Timer 1 reload value
+    0x0024: 'HW_T01MOD',    # Timer 0/1 mode
+    0x0025: 'HW_TFFCR',     # Timer flip-flop control
+    0x0026: 'HW_TREG2',     # Timer 2 (PWM0)
+    0x0027: 'HW_TREG3',     # Timer 3 (audio, PWM1)
+    0x0028: 'HW_T23MOD',    # Timer 2/3 mode
+    0x006B: 'HW_WATCHDOG_ALT', # Alt watchdog (Metal Slug)
+    0x006F: 'HW_WATCHDOG',  # Watchdog — write 0x4E to reset
+    0x0073: 'HW_ROM_BANK',  # ROM bank register
+    0x007C: 'HW_DMA0V',     # DMA channel 0 vector
+    0x007D: 'HW_DMA1V',     # DMA channel 1 vector
+    0x007E: 'HW_DMA2V',     # DMA channel 2 vector
+    0x007F: 'HW_DMA3V',     # DMA channel 3 vector
+}
+
+# Memory-mapped hardware registers
+HW_MEM = {
+    0x6F80: 'HW_BAT_VOLT',      # Battery voltage (u16)
+    0x6F82: 'HW_JOYPAD',        # Joypad state
+    0x6F84: 'HW_USR_BOOT',      # Boot reason (0=normal, 1=resume, 2=alarm)
+    0x6F85: 'HW_USR_SHUTDOWN',  # OS-requested shutdown flag
+    0x6F86: 'HW_USR_ANSWER',    # User response (bit5 must be 0)
+    0x6F87: 'HW_LANGUAGE',      # System language
+    0x6F91: 'HW_OS_VERSION',    # 0=NGP mono, !=0=NGPC color
+    0x6FCC: 'VBL_VECTOR_LO',    # VBlank ISR low word (user sets this)
+    0x6FCE: 'VBL_VECTOR_HI',    # VBlank ISR high word
+    0x8000: 'K2GE_BASE',
+    0x8002: 'K2GE_TRANSPARENCY',
+    0x8008: 'K2GE_SCR1_SCROLL_X',
+    0x8009: 'K2GE_SCR1_SCROLL_Y',
+    0x800A: 'K2GE_SCR2_SCROLL_X',
+    0x800B: 'K2GE_SCR2_SCROLL_Y',
+    0x8010: 'K2GE_BG_COLOR',
+    0x8012: 'K2GE_WIN_X1',
+    0x8013: 'K2GE_WIN_Y1',
+    0x8014: 'K2GE_WIN_X2',
+    0x8015: 'K2GE_WIN_Y2',
+    0x8102: 'K2GE_LED',
+    0x8800: 'SPR_VRAM_BASE',    # Sprite VRAM (64 sprites × 4 bytes)
+    0x8C00: 'SPR_PAL_IDX_BASE', # Sprite palette indices
+    0x9000: 'SCR1_MAP_BASE',    # Scroll plane 1 tilemap
+    0x9800: 'SCR2_MAP_BASE',    # Scroll plane 2 tilemap
+    0xA000: 'TILE_RAM_BASE',    # Character/Tile RAM
+}
+
+# DMA control register numbers → names (for LDC instruction)
+CR_NAMES = {
+    0x00: 'DMAS0', 0x04: 'DMAS1', 0x08: 'DMAS2', 0x0C: 'DMAS3',
+    0x10: 'DMAD0', 0x14: 'DMAD1', 0x18: 'DMAD2', 0x1C: 'DMAD3',
+    0x20: 'DMAC0', 0x22: 'DMAM0',
+    0x24: 'DMAC1', 0x26: 'DMAM1',
+    0x28: 'DMAC2', 0x2A: 'DMAM2',
+    0x2C: 'DMAC3', 0x2E: 'DMAM3',
+    0x30: 'INTNEST',
+}
+
+# SWI function names
+SWI_NAMES = {
+    0: 'BIOS_SHUTDOWN',
+    1: 'BIOS_CLOCKGEARSET',
+    2: 'BIOS_RTCGET',
+    5: 'BIOS_SYSFONTSET',
+    6: 'BIOS_FLASHWRITE',
+    8: 'BIOS_FLASHERS',
+    9: 'BIOS_ALARMSET',
+}
+
+# ============================================================
+# Address annotation helpers
+# ============================================================
+
+def annotate_addr(addr):
+    """Return symbolic name for a known address, or None."""
+    if addr in HW_IO:
+        return HW_IO[addr]
+    if addr in HW_MEM:
+        return HW_MEM[addr]
+    if addr == 0xFFFE00:
+        return 'BIOS_VECTOR_TABLE'
+    if 0xFF0000 <= addr <= 0xFFFFFF:
+        return f'BIOS+0x{addr - 0xFF0000:04X}'
+    return None
+
+def fmt_addr(addr):
+    """Format address with optional annotation."""
+    name = annotate_addr(addr)
+    s = f'0x{addr:06X}'
+    if name:
+        s += f'  ; {name}'
+    return s
+
+def fmt_mem(addr, size_hint=''):
+    """Format memory operand (addr) with annotation."""
+    name = annotate_addr(addr)
+    if name:
+        return f'({name})', f'= 0x{addr:04X}'
+    return f'(0x{addr:04X})', None
+
+# ============================================================
+# Byte-level helpers
+# ============================================================
+
+def u8(data, i):
+    return data[i]
+
+def u16(data, i):
+    return data[i] | (data[i+1] << 8)
+
+def u24(data, i):
+    return data[i] | (data[i+1] << 8) | (data[i+2] << 16)
+
+def u32(data, i):
+    return data[i] | (data[i+1] << 8) | (data[i+2] << 16) | (data[i+3] << 24)
+
+def s8(data, i):
+    v = data[i]
+    return v - 256 if v >= 128 else v
+
+def s16(data, i):
+    v = u16(data, i)
+    return v - 65536 if v >= 32768 else v
+
+def _safe(data, i, n=1):
+    """True if data[i..i+n-1] is accessible."""
+    return i + n <= len(data)
+
+# ============================================================
+# Broken opcode detection
+# ============================================================
+
+def _is_broken_d0_family(b, context='alu'):
+    """D0-D7 as ALU word-register source prefix = BROKEN on NGPC silicon."""
+    return 0xD0 <= b <= 0xD7 and context == 'alu'
+
+def check_broken_link(n):
+    """LINK XIY, N with N >= 5 is broken on NGPC silicon."""
+    return n >= 5
+
+# ============================================================
+# decode_fixed — simple 1..4 byte opcodes
+# Returns (length, mnem, ops, refs, warn) or None
+# refs = list of (target_addr, 'call'|'jump')
+# ============================================================
+
+def decode_fixed(data, pos, cur_addr, base):
+    b = data[pos]
+    refs = []
+    warn = None
+
+    if b == 0x00:
+        return (1, 'nop', '', refs, warn)
+
+    if b == 0x06:
+        if not _safe(data, pos, 2): return None
+        n = data[pos+1]
+        if n == 0x07:
+            return (2, 'di', '', refs, warn)
+        return (2, 'ei', str(n), refs, warn)
+
+    if b == 0x07:
+        return (1, 'reti', '', refs, warn)
+
+    if b == 0x08:
+        if not _safe(data, pos, 3): return None
+        n8, imm8 = data[pos+1], data[pos+2]
+        nm = annotate_addr(n8)
+        op1 = f'({nm})' if nm else f'(0x{n8:02X})'
+        return (3, 'ldb', f'{op1}, 0x{imm8:02X}', refs, warn)
+
+    if b == 0x09:
+        if not _safe(data, pos, 2): return None
+        imm8 = data[pos+1]
+        return (2, 'push', f'0x{imm8:02X}', refs, warn)
+
+    if b == 0x0A:
+        if not _safe(data, pos, 4): return None
+        n8 = data[pos+1]
+        imm16 = u16(data, pos+2)
+        nm = annotate_addr(n8)
+        op1 = f'({nm})' if nm else f'(0x{n8:02X})'
+        return (4, 'ldw', f'{op1}, 0x{imm16:04X}', refs, warn)
+
+    if b == 0x0B:
+        if not _safe(data, pos, 3): return None
+        imm16 = u16(data, pos+1)
+        return (3, 'pushw', f'0x{imm16:04X}', refs, warn)
+
+    if b == 0x0C:
+        return (1, 'incf', '', refs, warn)
+
+    if b == 0x0D:
+        return (1, 'decf', '', refs, warn)
+
+    if b == 0x0E:
+        return (1, 'ret', '', refs, warn)
+
+    if b == 0x0F:
+        if not _safe(data, pos, 3): return None
+        d = s16(data, pos+1)
+        return (3, 'retd', f'{d}', refs, warn)
+
+    if b == 0x10:
+        return (1, 'rcf', '', refs, warn)
+
+    if b == 0x11:
+        return (1, 'scf', '', refs, warn)
+
+    if b == 0x12:
+        return (1, 'ccf', '', refs, warn)
+
+    if b == 0x13:
+        return (1, 'zcf', '', refs, warn)
+
+    if b == 0x14:
+        return (1, 'push', 'A', refs, warn)
+
+    if b == 0x15:
+        return (1, 'pop', 'A', refs, warn)
+
+    if b == 0x16:
+        return (1, 'ex', "F,F'", refs, warn)
+
+    if b == 0x17:
+        if not _safe(data, pos, 2): return None
+        n = data[pos+1] & 0x07
+        return (2, 'ldf', str(n), refs, warn)
+
+    if b == 0x18:
+        return (1, 'push', 'F', refs, warn)
+
+    if b == 0x19:
+        return (1, 'pop', 'F', refs, warn)
+
+    if b == 0x1A:
+        # JP #16
+        if not _safe(data, pos, 3): return None
+        addr = u16(data, pos+1)
+        nm = annotate_addr(addr)
+        s = f'0x{addr:04X}'
+        if nm: s += f'  ; {nm}'
+        refs.append((addr, 'jump'))
+        return (3, 'jp', s, refs, warn)
+
+    if b == 0x1B:
+        # JP #24
+        if not _safe(data, pos, 4): return None
+        addr = u24(data, pos+1)
+        nm = annotate_addr(addr)
+        s = f'0x{addr:06X}'
+        if nm: s += f'  ; {nm}'
+        refs.append((addr, 'jump'))
+        return (4, 'jp', s, refs, warn)
+
+    if b == 0x1C:
+        # CALL #16
+        if not _safe(data, pos, 3): return None
+        addr = u16(data, pos+1)
+        nm = annotate_addr(addr)
+        s = f'0x{addr:04X}'
+        if nm: s += f'  ; {nm}'
+        refs.append((addr, 'call'))
+        return (3, 'call', s, refs, warn)
+
+    if b == 0x1D:
+        # CALL #24
+        if not _safe(data, pos, 4): return None
+        addr = u24(data, pos+1)
+        nm = annotate_addr(addr)
+        s = f'0x{addr:06X}'
+        if nm: s += f'  ; {nm}'
+        refs.append((addr, 'call'))
+        return (4, 'call', s, refs, warn)
+
+    if b == 0x1E:
+        # CALR d16 (relative call)
+        if not _safe(data, pos, 3): return None
+        d = s16(data, pos+1)
+        addr = (cur_addr + 3 + d) & 0xFFFFFF
+        nm = annotate_addr(addr)
+        s = f'0x{addr:06X}'
+        if nm: s += f'  ; {nm}'
+        refs.append((addr, 'call'))
+        return (3, 'calr', s, refs, warn)
+
+    if b == 0xF7:
+        # LDX (#8),#8 — 6 bytes
+        if not _safe(data, pos, 6): return None
+        n8  = data[pos+2]
+        imm = data[pos+4]
+        nm = annotate_addr(n8)
+        op1 = f'({nm})' if nm else f'(0x{n8:02X})'
+        return (6, 'ldx', f'{op1}, 0x{imm:02X}', refs, warn)
+
+    if 0xF8 <= b <= 0xFF:
+        # SWI n
+        n = b & 0x07
+        nm = SWI_NAMES.get(n, '')
+        s = str(n)
+        if nm: s += f'  ; {nm}'
+        return (1, 'swi', s, refs, warn)
+
+    # 0x02: PUSH SR, 0x03: POP SR, 0x05: HALT
+    if b == 0x02:
+        return (1, 'push', 'SR', refs, warn)
+    if b == 0x03:
+        return (1, 'pop', 'SR', refs, warn)
+    if b == 0x05:
+        return (1, 'halt', '', refs, warn)
+
+    return None  # not a fixed opcode
+
+# ============================================================
+# decode_xx — 0x20..0x7F range (LD imm, PUSH, POP, JR, JRL)
+# ============================================================
+
+def decode_xx(data, pos, cur_addr, base):
+    b = data[pos]
+    refs = []
+    warn = None
+
+    grp = b & 0xF8
+    r   = b & 0x07
+
+    if grp == 0x20:
+        # LD R8, imm8
+        if not _safe(data, pos, 2): return None
+        imm = data[pos+1]
+        return (2, 'ld', f'{R8[r]}, 0x{imm:02X}', refs, warn)
+
+    if grp == 0x28:
+        # PUSH R16
+        return (1, 'push', R16[r], refs, warn)
+
+    if grp == 0x30:
+        # LD R16, imm16
+        if not _safe(data, pos, 3): return None
+        imm = u16(data, pos+1)
+        nm = annotate_addr(imm)
+        s = f'0x{imm:04X}'
+        if nm: s += f'  ; {nm}'
+        return (3, 'ld', f'{R16[r]}, {s}', refs, warn)
+
+    if grp == 0x38:
+        # PUSH R32
+        return (1, 'push', R32[r], refs, warn)
+
+    if grp == 0x40:
+        # LD R32, imm32
+        if not _safe(data, pos, 5): return None
+        imm = u32(data, pos+1)
+        nm = annotate_addr(imm)
+        s = f'0x{imm:08X}'
+        if nm: s = f'{nm}  ; 0x{imm:08X}'
+        # Check if this looks like a ROM pointer
+        if ROM_BASE <= imm <= 0x3FFFFF:
+            refs.append((imm, 'data'))
+        return (5, 'ld', f'{R32[r]}, {s}', refs, warn)
+
+    if grp == 0x48:
+        # POP R16
+        return (1, 'pop', R16[r], refs, warn)
+
+    if grp == 0x50:
+        # SCC cc, r  (set-on-condition — not common in NGPC code)
+        # Note: ngdis shows 0x50-0x57 as SCC in some contexts
+        return (1, 'pop', R32[r], refs, warn)  # actually POP R32 in our assembler
+
+    if grp == 0x58:
+        # POP R32
+        return (1, 'pop', R32[r], refs, warn)
+
+    # JR / JRL — handled by bit pattern
+    if (b & 0x70) == 0x70:
+        # JRL cc, disp16 (3 bytes)
+        if not _safe(data, pos, 3): return None
+        cc_idx = b & 0x0F
+        d = s16(data, pos+1)
+        target = (cur_addr + 3 + d) & 0xFFFFFF
+        cc_str = '' if cc_idx == 8 else f'{CC[cc_idx]}, '
+        refs.append((target, 'jump'))
+        nm = annotate_addr(target)
+        s = f'0x{target:06X}'
+        if nm: s += f'  ; {nm}'
+        return (3, 'jrl', f'{cc_str}{s}', refs, warn)
+
+    if (b & 0x60) == 0x60:
+        # JR cc, disp8 (2 bytes)
+        if not _safe(data, pos, 2): return None
+        cc_idx = b & 0x0F
+        d = s8(data, pos+1)
+        target = (cur_addr + 2 + d) & 0xFFFFFF
+        cc_str = '' if cc_idx == 8 else f'{CC[cc_idx]}, '
+        refs.append((target, 'jump'))
+        nm = annotate_addr(target)
+        s = f'0x{target:06X}'
+        if nm: s += f'  ; {nm}'
+        return (2, 'jr', f'{cc_str}{s}', refs, warn)
+
+    return None
+
+# ============================================================
+# decode_zz_r — C8+zz+r prefix family (ALU on registers, LINK, UNLK, etc.)
+# Covers: 0xC8..0xCF (byte), 0xD0..0xD7 (word, BROKEN), 0xD8..0xDF (long),
+#         0xE8..0xEF (E8+r32 special)
+# ============================================================
+
+def _zz_regs(b):
+    """Returns (size_str, reg_name, is_broken) for C8+zz+r / E8+r prefix byte.
+    Note: 0xC7/0xCF/0xD7/0xDF/0xE7/0xEF have r=7 → extended register (next byte = reg index).
+    These are handled separately via EXTENDED_REG sentinel.
+    """
+    if 0xC8 <= b <= 0xCF:
+        return ('b', R8[b & 7], False)
+    if 0xD0 <= b <= 0xD7:
+        return ('w', R16[b & 7], True)   # BROKEN on NGPC!
+    if 0xD8 <= b <= 0xDF:
+        return ('l', R32[b & 7], False)  # Long (NOT word despite getzz=1 in ngdis)
+    if 0xE8 <= b <= 0xEF:
+        return ('l', R32[b & 7], False)
+    # 0xC7 / extended register prefix (getmem(0xC7)=23 → routes to decode_zz_r)
+    if b == 0xC7:
+        return ('b', None, False)   # None = extended, next byte is reg index
+    return (None, None, False)
+
+def _imm_for_size(sz):
+    return {'b': 1, 'w': 2, 'l': 4}.get(sz, 1)
+
+def decode_zz_r(data, pos, cur_addr, base):
+    if not _safe(data, pos, 2): return None
+    b  = data[pos]
+    c  = data[pos+1]
+    sz, reg, broken = _zz_regs(b)
+
+    refs = []
+    warn = '!BROKEN D0..D7 ALU (word-reg prefix)' if broken else None
+    is_e8 = (0xE8 <= b <= 0xEF)
+
+    # ---- Extended register prefix (0xC7) — next byte is bank reg index ----
+    if b == 0xC7:
+        if not _safe(data, pos, 3): return None
+        bank_idx = data[pos+1]
+        bank_num = bank_idx >> 4
+        reg_num  = bank_idx & 0x07
+        ext_reg  = f'r{R8[reg_num]}{bank_num}'   # e.g. rA2, rW3
+        c2 = data[pos+2]
+        if c2 == 0x04: return (3, 'push', ext_reg, refs, warn)
+        if c2 == 0x05: return (3, 'pop',  ext_reg, refs, warn)
+        if c2 == 0x06: return (3, 'cpl',  ext_reg, refs, warn)
+        if c2 == 0x07: return (3, 'neg',  ext_reg, refs, warn)
+        if c2 == 0x12: return (3, 'extz', ext_reg, refs, warn)
+        if c2 == 0x13: return (3, 'exts', ext_reg, refs, warn)
+        if c2 == 0x03:
+            if not _safe(data, pos, 4): return None
+            return (4, 'ld', f'{ext_reg}, 0x{data[pos+3]:02X}', refs, warn)
+        if 0x60 <= c2 <= 0x67:
+            return (3, 'inc', f'{(c2 & 7) or 8}, {ext_reg}', refs, warn)
+        if 0x68 <= c2 <= 0x6F:
+            return (3, 'dec', f'{(c2 & 7) or 8}, {ext_reg}', refs, warn)
+        if 0xA8 <= c2 <= 0xAF:
+            return (3, 'ld',  f'{ext_reg}, {c2 & 7}', refs, warn)
+        if 0xC8 <= c2 <= 0xCF:
+            if not _safe(data, pos, 4): return None
+            return (4, 'add', f'{ext_reg}, 0x{data[pos+3]:02X}', refs, warn)
+        if 0xCF == c2:
+            if not _safe(data, pos, 4): return None
+            return (4, 'cp',  f'{ext_reg}, 0x{data[pos+3]:02X}', refs, warn)
+        if 0xD8 <= c2 <= 0xDF:
+            return (3, 'cp',  f'{ext_reg}, {c2 & 7}', refs, warn)
+        for base_op, mnem in [(0x80,'add'),(0x88,'ld'),(0x90,'adc'),(0x98,'ld'),
+                               (0xA0,'sub'),(0xB0,'sbc'),(0xC0,'and'),
+                               (0xD0,'xor'),(0xE0,'or'),(0xF0,'cp')]:
+            if base_op <= c2 < base_op + 8:
+                return (3, mnem, f'{R8[c2 & 7]}, {ext_reg}' if c2 >= 0x98 else
+                                 f'{ext_reg}, {R8[c2 & 7]}', refs, warn)
+        return (3, 'db', f'0x{b:02X}, 0x{bank_idx:02X}, 0x{c2:02X}', refs,
+                f'ext-reg bank{bank_num} op=0x{c2:02X}')
+
+    if reg is None:
+        return None
+
+    # ---- Single-op instructions (second byte is exact) ----
+    if c == 0x04:
+        return (2, 'push', reg, refs, warn)
+    if c == 0x05:
+        return (2, 'pop', reg, refs, warn)
+    if c == 0x06:
+        return (2, 'cpl', reg, refs, warn)
+    if c == 0x07:
+        return (2, 'neg', reg, refs, warn)
+    if c == 0x10:
+        return (2, 'daa', reg, refs, warn)
+    if c == 0x12:
+        return (2, 'extz', reg, refs, warn)
+    if c == 0x13:
+        return (2, 'exts', reg, refs, warn)
+
+    if c == 0x0C:
+        # LINK r32, d16 (E8+r, 4 bytes total)
+        if not _safe(data, pos, 4): return None
+        n = s16(data, pos+2)
+        w = ''
+        if check_broken_link(n):
+            w = f'!BROKEN link N={n}>=5 (silicon bug)'
+        return (4, 'link', f'{reg}, {n}', refs, w)
+
+    if c == 0x0D:
+        # UNLK r32
+        return (2, 'unlk', reg, refs, warn)
+
+    if c == 0x1C:
+        # DJNZ r, d8
+        if not _safe(data, pos, 3): return None
+        d = s8(data, pos+2)
+        target = (cur_addr + 3 + d) & 0xFFFFFF
+        refs.append((target, 'jump'))
+        return (3, 'djnz', f'{reg}, 0x{target:06X}', refs, warn)
+
+    if c == 0x2E:
+        # LDC cr, r  (write CR)
+        if not _safe(data, pos, 3): return None
+        cr = data[pos+2]
+        cr_nm = CR_NAMES.get(cr, f'CR_0x{cr:02X}')
+        return (3, 'ldc', f'{cr_nm}, {reg}', refs, warn)
+
+    if c == 0x2F:
+        # LDC r, cr  (read CR)
+        if not _safe(data, pos, 3): return None
+        cr = data[pos+2]
+        cr_nm = CR_NAMES.get(cr, f'CR_0x{cr:02X}')
+        return (3, 'ldc', f'{reg}, {cr_nm}', refs, warn)
+
+    if c == 0x03:
+        # LD r, imm
+        isz = _imm_for_size(sz)
+        if not _safe(data, pos, 2 + isz): return None
+        if isz == 1: imm = u8(data, pos+2)
+        elif isz == 2: imm = u16(data, pos+2)
+        else: imm = u32(data, pos+2)
+        nm = annotate_addr(imm)
+        s = f'0x{imm:0{isz*2}X}'
+        if nm: s += f'  ; {nm}'
+        return (2 + isz, 'ld', f'{reg}, {s}', refs, warn)
+
+    # ---- INC / DEC ----
+    if 0x60 <= c <= 0x67:
+        n = c & 0x07
+        if n == 0: n = 8
+        return (2, 'inc', f'{n}, {reg}', refs, warn)
+    if 0x68 <= c <= 0x6F:
+        n = c & 0x07
+        if n == 0: n = 8
+        return (2, 'dec', f'{n}, {reg}', refs, warn)
+
+    # ---- LD r, imm3 (3-bit immediate packed in opcode byte)  0xA8..0xAF ----
+    if 0xA8 <= c <= 0xAF:
+        imm3 = c & 0x07
+        return (2, 'ld', f'{reg}, {imm3}', refs, warn)
+
+    # ---- CP r, imm3  0xD8..0xDF ----
+    if 0xD8 <= c <= 0xDF:
+        imm3 = c & 0x07
+        return (2, 'cp', f'{reg}, {imm3}', refs, warn)
+
+    # ---- ALU R, r (second byte = op_base + R_dest) ----
+    # Determine destination register set based on source register size
+    def dest_reg(idx):
+        if sz == 'b': return R8[idx]
+        if sz == 'w': return R16[idx]
+        return R32[idx]
+
+    alu_r_ops = {
+        0x80: 'add', 0x88: 'ld',  0x90: 'adc', 0x98: None,  # 0x98 = LD r, R (reverse)
+        0xA0: 'sub', 0xB0: 'sbc', 0xB8: 'ex',
+        0xC0: 'and', 0xD0: 'xor', 0xE0: 'or',  0xF0: 'cp',
+    }
+    for base_op, mnem in alu_r_ops.items():
+        if base_op <= c < base_op + 8:
+            R_idx = c & 0x07
+            if base_op == 0x98:
+                # LD r, R  (reverse direction)
+                return (2, 'ld', f'{reg}, {dest_reg(R_idx)}', refs, warn)
+            if mnem:
+                return (2, mnem, f'{dest_reg(R_idx)}, {reg}', refs, warn)
+
+    # ---- ALU r, imm ----
+    alu_imm_ops = {
+        0xC8: 'add', 0xC9: 'adc', 0xCA: 'sub', 0xCB: 'sbc',
+        0xCC: 'and', 0xCD: 'xor', 0xCE: 'or',  0xCF: 'cp',
+    }
+    if c in alu_imm_ops:
+        isz = _imm_for_size(sz)
+        if not _safe(data, pos, 2 + isz): return None
+        if isz == 1: imm = u8(data, pos+2)
+        elif isz == 2: imm = u16(data, pos+2)
+        else: imm = u32(data, pos+2)
+        nm = annotate_addr(imm)
+        s = f'0x{imm:0{isz*2}X}'
+        if nm: s += f'  ; {nm}'
+        return (2 + isz, alu_imm_ops[c], f'{reg}, {s}', refs, warn)
+
+    # ---- Shifts / rotates by immediate ----
+    shift_ops = {
+        0xE8: 'rlc', 0xE9: 'rrc', 0xEA: 'rl',  0xEB: 'rr',
+        0xEC: 'sla', 0xED: 'sra', 0xEE: 'sll', 0xEF: 'srl',
+    }
+    if c in shift_ops:
+        if not _safe(data, pos, 3): return None
+        count = data[pos+2] & 0x0F
+        if count == 0: count = 16
+        return (3, shift_ops[c], f'{count}, {reg}', refs, warn)
+
+    # ---- Shifts / rotates by A ----
+    shift_a_ops = {
+        0xF8: 'rlc', 0xF9: 'rrc', 0xFA: 'rl',  0xFB: 'rr',
+        0xFC: 'sla', 0xFD: 'sra', 0xFE: 'sll', 0xFF: 'srl',
+    }
+    if c in shift_a_ops:
+        return (2, shift_a_ops[c], f'A, {reg}', refs, warn)
+
+    # ---- Bit operations ----
+    if 0x20 <= c <= 0x24:
+        bit_ops = {0x20:'andcf', 0x21:'orcf', 0x22:'xorcf', 0x23:'ldcf', 0x24:'stcf'}
+        if not _safe(data, pos, 3): return None
+        bit = data[pos+2] & 0x0F
+        return (3, bit_ops[c], f'{bit}, {reg}', refs, warn)
+    if 0x28 <= c <= 0x2C:
+        bit_a_ops = {0x28:'andcf', 0x29:'orcf', 0x2A:'xorcf', 0x2B:'ldcf', 0x2C:'stcf'}
+        return (2, bit_a_ops[c], f'A, {reg}', refs, warn)
+    if 0x30 <= c <= 0x34:
+        bit2_ops = {0x30:'res', 0x31:'set', 0x32:'chg', 0x33:'bit', 0x34:'tset'}
+        if not _safe(data, pos, 3): return None
+        bit = data[pos+2] & 0x0F
+        return (3, bit2_ops[c], f'{bit}, {reg}', refs, warn)
+
+    # ---- SCC cc, r ----
+    if 0x70 <= c <= 0x7F:
+        cc_idx = c & 0x0F
+        return (2, 'scc', f'{CC[cc_idx]}, {reg}', refs, warn)
+
+    # ---- MUL/DIV ----
+    if 0x40 <= c <= 0x47: return (2, 'mul',  f'{dest_reg(c & 7)}, {reg}', refs, warn)
+    if 0x48 <= c <= 0x4F: return (2, 'muls', f'{dest_reg(c & 7)}, {reg}', refs, warn)
+    if 0x50 <= c <= 0x57: return (2, 'div',  f'{dest_reg(c & 7)}, {reg}', refs, warn)
+    if 0x58 <= c <= 0x5F: return (2, 'divs', f'{dest_reg(c & 7)}, {reg}', refs, warn)
+
+    return None  # unrecognized
+
+# ============================================================
+# decode_zz_mem — indirect and abs16 forms
+# Covers: (r32+d8) loads/stores, abs16 via C1/D1, post-inc, LDIW, LDIRW
+# ============================================================
+
+def _getmem(b):
+    mm = b & 0x4F
+    return ((mm & 0x40) >> 2) | (mm & 0x0F)
+
+def _getzz_mem(b):
+    return (b & 0x30) >> 4
+
+def decode_zz_mem(data, pos, cur_addr, base):
+    b = data[pos]
+    refs = []
+    warn = None
+
+    mem = _getmem(b)
+    zz  = _getzz_mem(b)
+
+    # ============================================================
+    # D2-D5: abs-load forms used safely by CC900 (like D1 abs16)
+    # D2=abs24, D3=ARI, D4=ARI_PD, D5=ARI_PI — SAFE when op=0x20+R (LD R16, (mem))
+    # Must be tried BEFORE the BROKEN handler below.
+    # ============================================================
+    if 0xD2 <= b <= 0xD5:
+        mem2 = _getmem(b)
+        n2, mem_str2, addr_val2 = _retmem_info(data, pos, mem2)
+        if n2 is not None and _safe(data, pos, n2 + 1):
+            op2 = data[pos + n2]
+            if 0x20 <= op2 <= 0x27:          # LD R16, (mem) — safe load
+                r_idx2 = op2 & 0x07
+                ann2 = ''
+                if addr_val2 is not None:
+                    _, anm2 = fmt_mem(addr_val2)
+                    if anm2: ann2 = f'  ; {anm2}'
+                return (n2+1, 'ld', f'{R16[r_idx2]}, {mem_str2}{ann2}', refs, warn)
+
+    # ============================================================
+    # BROKEN word-reg ALU prefix (D0-D7) falling into decode_zz_mem path
+    # D0: all uses broken. D2-D5 ALU sub-ops also broken (non-load ops).
+    # ============================================================
+    if 0xD0 <= b <= 0xD7 and b != 0xD1:
+        warn = f'!BROKEN D{b-0xD0} word-reg ALU prefix (NGPC silicon bug)'
+        if not _safe(data, pos, 2): return None
+        c = data[pos+1]
+        reg = R16[b & 7]
+        # Try to show what op it attempts: second byte = operation
+        if c == 0x06: return (2, 'cpl', reg, refs, warn)
+        if c == 0x07: return (2, 'neg', reg, refs, warn)
+        if c == 0x12: return (2, 'extz', reg, refs, warn)
+        if c == 0x0C and _safe(data, pos, 4):
+            n = s16(data, pos+2)
+            return (4, 'link', f'{reg}, {n}', refs, warn)
+        if 0x60 <= c <= 0x67:
+            n = c & 7
+            return (2, 'inc', f'{n or 8}, {reg}', refs, warn)
+        if 0x68 <= c <= 0x6F:
+            n = c & 7
+            return (2, 'dec', f'{n or 8}, {reg}', refs, warn)
+        # ALU r, imm
+        alu_w = {0xC8:'add', 0xC9:'adc', 0xCA:'sub', 0xCB:'sbc',
+                 0xCC:'and', 0xCD:'xor', 0xCE:'or', 0xCF:'cp'}
+        if c in alu_w and _safe(data, pos, 4):
+            imm = u16(data, pos+2)
+            return (4, alu_w[c], f'{reg}, 0x{imm:04X}', refs, warn)
+        # ALU R, r
+        for base_op, mnem in [(0x80,'add'),(0x88,'ld'),(0x90,'adc'),
+                               (0xA0,'sub'),(0xB0,'sbc'),(0xC0,'and'),
+                               (0xD0,'xor'),(0xE0,'or'),(0xF0,'cp')]:
+            if base_op <= c < base_op + 8:
+                return (2, mnem, f'{R16[c&7]}, {reg}', refs, warn)
+        return (2, 'db', f'0x{b:02X}, 0x{c:02X}', refs, warn)
+
+    # ============================================================
+    # Special hard-coded patterns from our toolchain (confirmed HW)
+    # ============================================================
+
+    # LDIW  (XDE+),(XHL+)  — single word copy — 0x84 0x10
+    if b == 0x84 and _safe(data, pos, 2) and data[pos+1] == 0x10:
+        return (2, 'ldiw', '(XDE+),(XHL+)', refs, warn)
+
+    # LDIRW (XDE+),(XHL+)  — repeat word copy — 0x95 0x11
+    if b == 0x95 and _safe(data, pos, 2) and data[pos+1] == 0x11:
+        return (2, 'ldirw', '(XDE+),(XHL+)', refs, warn)
+
+    # ============================================================
+    # (r32+d8) forms — load
+    # 0x88..0x8F d8 op  → LD R8, (r32+d8)
+    # 0x98..0x9F d8 op  → LD R16, (r32+d8)
+    # 0xA8..0xAF d8 op  → LD R32, (r32+d8)
+    # ============================================================
+    if 0x88 <= b <= 0x8F:
+        if not _safe(data, pos, 3): return None
+        r32_idx = b & 0x07
+        d = s8(data, pos+1)
+        op = data[pos+2]
+        if 0x20 <= op <= 0x27:
+            r_idx = op & 0x07
+            sign = '+' if d >= 0 else ''
+            return (3, 'ld', f'{R8[r_idx]}, ({R32[r32_idx]}{sign}{d})', refs, warn)
+
+    if 0x98 <= b <= 0x9F:
+        if not _safe(data, pos, 3): return None
+        r32_idx = b & 0x07
+        d = s8(data, pos+1)
+        op = data[pos+2]
+        if 0x20 <= op <= 0x27:
+            r_idx = op & 0x07
+            sign = '+' if d >= 0 else ''
+            return (3, 'ld', f'{R16[r_idx]}, ({R32[r32_idx]}{sign}{d})', refs, warn)
+
+    if 0xA8 <= b <= 0xAF:
+        if not _safe(data, pos, 3): return None
+        r32_idx = b & 0x07
+        d = s8(data, pos+1)
+        op = data[pos+2]
+        if 0x20 <= op <= 0x27:
+            r_idx = op & 0x07
+            sign = '+' if d >= 0 else ''
+            return (3, 'ld', f'{R32[r_idx]}, ({R32[r32_idx]}{sign}{d})', refs, warn)
+
+    # ============================================================
+    # (r32+d8) forms — store
+    # 0xB8..0xBF d8 op
+    # 0x30..0x37 → LD (r32+d8), R16 or R32
+    # 0x31..0x38 → LD (r32+d8), R8 (different base in our assembler)
+    # 0x50..0x57 → LD (r32+d8), R16 (ngdis convention)
+    # 0x60..0x67 → LD (r32+d8), R32
+    # ============================================================
+    if 0xB8 <= b <= 0xBF:
+        if not _safe(data, pos, 3): return None
+        r32_idx = b & 0x07
+        d = s8(data, pos+1)
+        op = data[pos+2]
+        sign = '+' if d >= 0 else ''
+        mem_str = f'({R32[r32_idx]}{sign}{d})'
+
+        if 0x40 <= op <= 0x47:
+            return (3, 'ld', f'{mem_str}, {R8[op & 7]}', refs, warn)
+        if 0x50 <= op <= 0x57:
+            return (3, 'ld', f'{mem_str}, {R16[op & 7]}', refs, warn)
+        if 0x60 <= op <= 0x67:
+            return (3, 'ld', f'{mem_str}, {R32[op & 7]}', refs, warn)
+        # Our assembler uses 0x30/0x31 for store (alternate encoding)
+        if 0x30 <= op <= 0x37:
+            # Ambiguous: could be R16 or R32 — use R16 (common case)
+            return (3, 'ld', f'{mem_str}, {R16[op & 7]}', refs, warn)
+        if 0x38 <= op <= 0x3F:
+            return (3, 'ld', f'{mem_str}, {R32[op & 7]}', refs, warn)
+        # Byte store variant 0x31+R8 (our toolchain)
+        # Already covered by 0x30-0x37 above; handle specifically if needed
+
+    # ============================================================
+    # abs16 byte load — C1 lo hi (0x20+R8)
+    # ============================================================
+    if b == 0xC1:
+        if not _safe(data, pos, 4): return None
+        addr = u16(data, pos+1)
+        op   = data[pos+3]
+        if 0x20 <= op <= 0x27:
+            r_idx = op & 0x07
+            mem_s, anm = fmt_mem(addr)
+            s = f'{R8[r_idx]}, {mem_s}'
+            if anm: s += f'  ; {anm}'
+            return (4, 'ld', s, refs, warn)
+
+    # ============================================================
+    # abs16 word load — D1 lo hi (0x20+R16)  (SAFE — not D0 ALU)
+    # ============================================================
+    if b == 0xD1:
+        if not _safe(data, pos, 4): return None
+        addr = u16(data, pos+1)
+        op   = data[pos+3]
+        if 0x20 <= op <= 0x27:
+            r_idx = op & 0x07
+            mem_s, anm = fmt_mem(addr)
+            s = f'{R16[r_idx]}, {mem_s}'
+            if anm: s += f'  ; {anm}'
+            return (4, 'ld', s, refs, warn)
+        # If NOT in 0x20-0x27, fall through to warn as D0-family ALU
+        warn = '!BROKEN? D1 as word-BC ALU prefix'
+        return (2, 'db', f'0xD1, 0x{op:02X}', refs, warn)
+
+    # ============================================================
+    # abs16 long load — E1 lo hi (0x20+R32)
+    # ============================================================
+    if b == 0xE1:
+        if not _safe(data, pos, 4): return None
+        addr = u16(data, pos+1)
+        op   = data[pos+3]
+        if 0x20 <= op <= 0x27:
+            r_idx = op & 0x07
+            mem_s, anm = fmt_mem(addr)
+            s = f'{R32[r_idx]}, {mem_s}'
+            if anm: s += f'  ; {anm}'
+            return (4, 'ld', s, refs, warn)
+
+    # ============================================================
+    # Post-increment store — C5 r32 (0x40+R8)
+    # Encoding: [0xC5, r32_idx, 0x40+R8_idx]
+    # ============================================================
+    if b == 0xC5:
+        if not _safe(data, pos, 3): return None
+        r32_idx = data[pos+1]
+        op = data[pos+2]
+        if r32_idx <= 7 and 0x40 <= op <= 0x47:
+            r8_idx = op & 0x07
+            return (3, 'ld', f'({R32[r32_idx]}+), {R8[r8_idx]}', refs, warn)
+
+    # ============================================================
+    # Post-increment load — 0x80 0x15 r32 (0x20+R8)
+    # Our toolchain: [0x80, 0x15, r32_idx, 0x20+r8_idx]
+    # ============================================================
+    if b == 0x80 and _safe(data, pos, 4) and data[pos+1] == 0x15:
+        r32_idx = data[pos+2]
+        op = data[pos+3]
+        if r32_idx <= 7 and 0x20 <= op <= 0x27:
+            r8_idx = op & 0x07
+            return (4, 'ld', f'{R8[r8_idx]}, ({R32[r32_idx]}+)', refs, warn)
+
+    # ============================================================
+    # General fallback using _retmem_info — covers all other mem modes
+    # (ARI_XWA..XSP, ARI_PD, ARI_PI, ARI, ABS_B, ABS_L, etc.)
+    # ============================================================
+    n, mem_str, addr_val = _retmem_info(data, pos, mem)
+    if n is None:
+        return None
+    if not _safe(data, pos, n + 1):
+        return None
+    op = data[pos + n]
+    ann = ''
+    if addr_val is not None:
+        _, anm = fmt_mem(addr_val)
+        if anm: ann = f'  ; {anm}'
+
+    # Select register set from zz
+    if zz == 0:   reg_set = R8
+    elif zz == 1: reg_set = R16
+    else:         reg_set = R32
+
+    # LD R, (mem) — 0x20+R
+    if 0x20 <= op <= 0x27:
+        return (n+1, 'ld', f'{reg_set[op & 7]}, {mem_str}{ann}', refs, warn)
+    # ALU R, (mem)
+    for base_op, mnem in [(0x80,'add'),(0x90,'adc'),(0xA0,'sub'),(0xB0,'sbc'),
+                           (0xC0,'and'),(0xD0,'xor'),(0xE0,'or'),(0xF0,'cp')]:
+        if base_op <= op < base_op + 8:
+            return (n+1, mnem, f'{reg_set[op & 7]}, {mem_str}{ann}', refs, warn)
+    # EX (mem), R — 0x30+R
+    if 0x30 <= op <= 0x37:
+        return (n+1, 'ex', f'{mem_str}, {reg_set[op & 7]}{ann}', refs, warn)
+    # ADD/SUB/AND/XOR/OR/CP (mem), R — 0x88+R range
+    for base_op, mnem in [(0x88,'add'),(0x98,'adc'),(0xA8,'sub'),(0xB8,'sbc'),
+                           (0xC8,'and'),(0xD8,'xor'),(0xE8,'or'),(0xF8,'cp')]:
+        if base_op <= op < base_op + 8:
+            return (n+1, mnem, f'{mem_str}, {reg_set[op & 7]}{ann}', refs, warn)
+    # INC/DEC n, (mem) — 0x60+n / 0x68+n
+    if 0x60 <= op <= 0x67:
+        cnt = (op & 7) or 8
+        return (n+1, 'inc', f'{cnt}, {mem_str}{ann}', refs, warn)
+    if 0x68 <= op <= 0x6F:
+        cnt = (op & 7) or 8
+        return (n+1, 'dec', f'{cnt}, {mem_str}{ann}', refs, warn)
+    # PUSH (mem) — 0x04
+    if op == 0x04:
+        return (n+1, 'push', f'{mem_str}{ann}', refs, warn)
+    # RLD/RRD [A], (mem) — 0x06/0x07
+    if op == 0x06: return (n+1, 'rld', f'[A], {mem_str}{ann}', refs, warn)
+    if op == 0x07: return (n+1, 'rrd', f'[A], {mem_str}{ann}', refs, warn)
+    # Rotates/shifts (mem) — 0x78..0x7F
+    shift_mem = {0x78:'rlc',0x79:'rrc',0x7A:'rl',0x7B:'rr',
+                 0x7C:'sla',0x7D:'sra',0x7E:'sll',0x7F:'srl'}
+    if op in shift_mem:
+        return (n+1, shift_mem[op], f'{mem_str}{ann}', refs, warn)
+    # ALU (mem), #imm — 0x38..0x3F
+    alu_imm = {0x38:'add',0x39:'adc',0x3A:'sub',0x3B:'sbc',
+               0x3C:'and',0x3D:'xor',0x3E:'or',0x3F:'cp'}
+    if op in alu_imm:
+        if zz == 0:
+            if not _safe(data, pos, n + 2): return None
+            imm = data[pos + n + 1]
+            return (n+2, alu_imm[op], f'{mem_str}, 0x{imm:02X}{ann}', refs, warn)
+        elif zz == 1:
+            if not _safe(data, pos, n + 3): return None
+            imm = u16(data, pos + n + 1)
+            return (n+3, alu_imm[op], f'{mem_str}, 0x{imm:04X}{ann}', refs, warn)
+    # LD (mem), #imm16 indirect — 0x19
+    if op == 0x19:
+        if not _safe(data, pos, n + 3): return None
+        src = u16(data, pos + n + 1)
+        src_s, src_anm = fmt_mem(src)
+        ann2 = f'  ; {src_anm}' if src_anm else ''
+        return (n+3, 'ld', f'{mem_str}, {src_s}{ann2}', refs, warn)
+
+    return None
+
+# ============================================================
+# _retmem_info — decode B0_mem / zz_mem address field
+# Returns (n_consumed, mem_str, addr_val_or_None) or (None, None, None)
+# n_consumed = bytes used by opcode + address (excludes trailing op byte)
+# ============================================================
+
+def _retmem_info(data, pos, mem):
+    if 0 <= mem <= 7:                    # (r32) — ARI_XWA..ARI_XSP
+        return (1, f'({R32[mem]})', None)
+    elif 8 <= mem <= 15:                 # (r32+d8) — ARID_XWA..ARID_XSP
+        if not _safe(data, pos, 2): return (None, None, None)
+        d = s8(data, pos+1)
+        sign = '+' if d >= 0 else ''
+        return (2, f'({R32[mem-8]}{sign}{d})', None)
+    elif mem == 16:                      # ABS_B: (addr8)
+        if not _safe(data, pos, 2): return (None, None, None)
+        addr = data[pos+1]
+        return (2, f'(0x{addr:02X})', addr)
+    elif mem == 17:                      # ABS_W: (addr16)
+        if not _safe(data, pos, 3): return (None, None, None)
+        addr = u16(data, pos+1)
+        return (3, f'(0x{addr:04X})', addr)
+    elif mem == 18:                      # ABS_L: (addr24)
+        if not _safe(data, pos, 4): return (None, None, None)
+        addr = u24(data, pos+1)
+        return (4, f'(0x{addr:06X})', addr)
+    elif mem == 19:                      # ARI: secondary byte encodes r32+mode
+        if not _safe(data, pos, 2): return (None, None, None)
+        b2 = data[pos+1]
+        mode = b2 & 0x03
+        r32_idx = (b2 & 0xFC) >> 2
+        if r32_idx >= len(R32): return (None, None, None)
+        if mode == 0x00:                 # (r32)
+            return (2, f'({R32[r32_idx]})', None)
+        elif mode == 0x01:               # (r32+d16)
+            if not _safe(data, pos, 4): return (None, None, None)
+            d = s16(data, pos+2)
+            sign = '+' if d >= 0 else ''
+            return (4, f'({R32[r32_idx]}{sign}{d})', None)
+        elif mode == 0x03:               # (r32+r8/r16)
+            if not _safe(data, pos, 4): return (None, None, None)
+            r32_i2 = (data[pos+2] & 0xFC) >> 2
+            r_i2   = data[pos+3] & 0x07
+            if r32_i2 >= len(R32): return (None, None, None)
+            if b2 & 0x04:
+                return (4, f'({R32[r32_i2]}+{R16[r_i2]})', None)
+            else:
+                return (4, f'({R32[r32_i2]}+{R8[r_i2]})', None)
+        return (None, None, None)
+    elif mem == 20:                      # ARI_PD: (-r32)
+        if not _safe(data, pos, 2): return (None, None, None)
+        r32_idx = (data[pos+1] & 0xFC) >> 2
+        if r32_idx >= len(R32): return (None, None, None)
+        return (2, f'(-{R32[r32_idx]})', None)
+    elif mem == 21:                      # ARI_PI: (r32+)
+        if not _safe(data, pos, 2): return (None, None, None)
+        r32_idx = (data[pos+1] & 0xFC) >> 2
+        if r32_idx >= len(R32): return (None, None, None)
+        return (2, f'({R32[r32_idx]}+)', None)
+    return (None, None, None)
+
+# ============================================================
+# decode_B0_mem — B0 memory forms (abs stores, RET cc, JP/CALL/LD indirect)
+# First byte has getzz == 3 (bits 5:4 = 11), so 0xB0-0xBF or 0xF0-0xFF
+# ============================================================
+
+def decode_B0_mem(data, pos, cur_addr, base):
+    b = data[pos]
+    refs = []
+    warn = None
+
+    # ---- RET cc  — 0xB0 + 0xF0+cc ----
+    if b == 0xB0 and _safe(data, pos, 2) and data[pos+1] >= 0xF0:
+        cc_idx = data[pos+1] & 0x0F
+        if cc_idx == 8:
+            return (2, 'ret', '', refs, warn)
+        return (2, 'ret', CC[cc_idx], refs, warn)
+
+    # ---- LDAR R, $+4+d16  — 0xF3 0x13 d16 op ----
+    if b == 0xF3 and _safe(data, pos, 2) and data[pos+1] == 0x13:
+        if not _safe(data, pos, 5): return None
+        d = s16(data, pos+2)
+        target = (cur_addr + 4 + d) & 0xFFFFFF
+        op = data[pos+4]
+        r_idx = op & 0x07
+        if op & 0x20:
+            return (5, 'ldar', f'{R32[r_idx]}, 0x{target:06X}', refs, warn)
+        return (5, 'ldar', f'{R16[r_idx]}, 0x{target:06X}', refs, warn)
+
+    # ---- General retmem dispatch ----
+    mem = _getmem(b)
+    n, mem_str, addr_val = _retmem_info(data, pos, mem)
+    if n is None:
+        return None
+
+    # Annotation for known HW addresses
+    ann = ''
+    if addr_val is not None:
+        _, anm = fmt_mem(addr_val)
+        if anm: ann = f'  ; {anm}'
+
+    if not _safe(data, pos, n + 1):
+        return None
+    op = data[pos + n]
+
+    # JP [cc,] (mem) — 0xD0+cc
+    if 0xD0 <= op <= 0xDF:
+        cc_idx = op & 0x0F
+        if cc_idx == 8:
+            return (n+1, 'jp', f'{mem_str}{ann}', refs, warn)
+        return (n+1, 'jp', f'{CC[cc_idx]}, {mem_str}{ann}', refs, warn)
+
+    # CALL [cc,] (mem) — 0xE0+cc
+    if 0xE0 <= op <= 0xEF:
+        cc_idx = op & 0x0F
+        if cc_idx == 8:
+            return (n+1, 'call', f'{mem_str}{ann}', refs, warn)
+        return (n+1, 'call', f'{CC[cc_idx]}, {mem_str}{ann}', refs, warn)
+
+    # LD (mem), R8 — 0x40+R8
+    if 0x40 <= op <= 0x47:
+        return (n+1, 'ld', f'{mem_str}, {R8[op & 7]}{ann}', refs, warn)
+
+    # LD (mem), R16 — 0x50+R16
+    if 0x50 <= op <= 0x57:
+        return (n+1, 'ldw', f'{mem_str}, {R16[op & 7]}{ann}', refs, warn)
+
+    # LD (mem), R32 — 0x60+R32
+    if 0x60 <= op <= 0x67:
+        return (n+1, 'ld', f'{mem_str}, {R32[op & 7]}{ann}', refs, warn)
+
+    # LDA R16, (mem) — 0x20+R16
+    if 0x20 <= op <= 0x27:
+        return (n+1, 'lda', f'{R16[op & 7]}, {mem_str}{ann}', refs, warn)
+
+    # LDA R32, (mem) — 0x30+R32
+    if 0x30 <= op <= 0x37:
+        return (n+1, 'lda', f'{R32[op & 7]}, {mem_str}{ann}', refs, warn)
+
+    # LD (mem), #imm8 — 0x00 imm8
+    if op == 0x00:
+        if not _safe(data, pos, n + 2): return None
+        imm8 = data[pos + n + 1]
+        return (n+2, 'ld', f'{mem_str}, 0x{imm8:02X}{ann}', refs, warn)
+
+    # LDW (mem), #imm16 — 0x02 lo hi
+    if op == 0x02:
+        if not _safe(data, pos, n + 3): return None
+        imm16 = u16(data, pos + n + 1)
+        return (n+3, 'ldw', f'{mem_str}, 0x{imm16:04X}{ann}', refs, warn)
+
+    # POP (mem) — 0x04
+    if op == 0x04:
+        return (n+1, 'pop', f'{mem_str}{ann}', refs, warn)
+
+    # POPW (mem) — 0x06
+    if op == 0x06:
+        return (n+1, 'popw', f'{mem_str}{ann}', refs, warn)
+
+    # LD (mem), (#16) — 0x14 lo hi
+    if op == 0x14:
+        if not _safe(data, pos, n + 3): return None
+        src = u16(data, pos + n + 1)
+        src_s, src_anm = fmt_mem(src)
+        ann2 = f'  ; {src_anm}' if src_anm else ''
+        return (n+3, 'ld', f'{mem_str}, {src_s}{ann2}', refs, warn)
+
+    # LDW (mem), (#16) — 0x16 lo hi
+    if op == 0x16:
+        if not _safe(data, pos, n + 3): return None
+        src = u16(data, pos + n + 1)
+        src_s, src_anm = fmt_mem(src)
+        ann2 = f'  ; {src_anm}' if src_anm else ''
+        return (n+3, 'ldw', f'{mem_str}, {src_s}{ann2}', refs, warn)
+
+    # Bit manipulation instructions
+    if op == 0x28: return (n+1, 'andcf', f'A, {mem_str}{ann}', refs, warn)
+    if op == 0x29: return (n+1, 'orcf',  f'A, {mem_str}{ann}', refs, warn)
+    if op == 0x2A: return (n+1, 'xorcf', f'A, {mem_str}{ann}', refs, warn)
+    if op == 0x2B: return (n+1, 'ldcf',  f'A, {mem_str}{ann}', refs, warn)
+    if op == 0x2C: return (n+1, 'stcf',  f'A, {mem_str}{ann}', refs, warn)
+    if 0x80 <= op <= 0x87: return (n+1, 'andcf', f'{op & 7}, {mem_str}{ann}', refs, warn)
+    if 0x88 <= op <= 0x8F: return (n+1, 'orcf',  f'{op & 7}, {mem_str}{ann}', refs, warn)
+    if 0x90 <= op <= 0x97: return (n+1, 'xorcf', f'{op & 7}, {mem_str}{ann}', refs, warn)
+    if 0x98 <= op <= 0x9F: return (n+1, 'ldcf',  f'{op & 7}, {mem_str}{ann}', refs, warn)
+    if 0xA0 <= op <= 0xA7: return (n+1, 'stcf',  f'{op & 7}, {mem_str}{ann}', refs, warn)
+    if 0xA8 <= op <= 0xAF: return (n+1, 'tset',  f'{op & 7}, {mem_str}{ann}', refs, warn)
+    if 0xB0 <= op <= 0xB7: return (n+1, 'res',   f'{op & 7}, {mem_str}{ann}', refs, warn)
+    if 0xB8 <= op <= 0xBF: return (n+1, 'set',   f'{op & 7}, {mem_str}{ann}', refs, warn)
+    if 0xC0 <= op <= 0xC7: return (n+1, 'chg',   f'{op & 7}, {mem_str}{ann}', refs, warn)
+    if 0xC8 <= op <= 0xCF: return (n+1, 'bit',   f'{op & 7}, {mem_str}{ann}', refs, warn)
+
+    return None
+
+# ============================================================
+# Main decode dispatcher
+# ============================================================
+
+def decode_one(data, pos, cur_addr, base):
+    """
+    Decode one instruction.
+    Returns (length, mnem, ops, refs, warn) or None on failure.
+    refs = [(addr, 'call'|'jump'|'data'), ...]
+    """
+    if pos >= len(data):
+        return None
+
+    b = data[pos]
+
+    # 1. Try fixed opcodes first
+    r = decode_fixed(data, pos, cur_addr, base)
+    if r: return r
+
+    # 2. < 0x80 → decode_xx (LD imm, PUSH, POP, JR, JRL)
+    if b < 0x80:
+        r = decode_xx(data, pos, cur_addr, base)
+        if r: return r
+
+    # 3. >= 0x80 → check zz and mem fields
+    if b >= 0x80:
+        zz  = (b & 0x30) >> 4
+        mem = _getmem(b)
+
+        if zz == 3:
+            # B0_mem group (abs16 stores, RET cc, indirect JP/CALL)
+            r = decode_B0_mem(data, pos, cur_addr, base)
+            if r: return r
+        else:
+            if mem >= 23:
+                # C8+zz+r ALU / E8+r special
+                r = decode_zz_r(data, pos, cur_addr, base)
+                if r: return r
+            elif mem <= 21:
+                # Indirect loads/stores
+                r = decode_zz_mem(data, pos, cur_addr, base)
+                if r: return r
+
+    # Fallback: emit raw byte
+    return (1, 'db', f'0x{b:02X}', [], '?? unknown opcode')
+
+# ============================================================
+# ROM header parser
+# ============================================================
+
+def parse_header(data):
+    """Parse NGPC ROM header. Returns dict or None."""
+    if len(data) < HEADER_SIZE:
+        return None
+    copyright_s = data[0:28]
+    if (copyright_s != b"COPYRIGHT BY SNK CORPORATION" and
+        copyright_s != b" LICENSED BY SNK CORPORATION"):
+        return None
+    licensed = (copyright_s[0:1] == b' ')
+    entry    = u32(data, 0x1C) if len(data) >= 0x20 else ROM_BASE + HEADER_SIZE
+    sw_id    = u16(data, 0x20) if len(data) >= 0x22 else 0
+    color    = (data[0x23] == 0x10) if len(data) >= 0x24 else False
+    title    = data[0x24:0x30].rstrip(b' \x00').decode('ascii', errors='replace')
+    return {
+        'licensed': licensed,
+        'entry':    entry,
+        'sw_id':    sw_id,
+        'color':    color,
+        'title':    title,
+        'base':     ROM_BASE,
+    }
+
+# ============================================================
+# Label manager
+# ============================================================
+
+class LabelMap:
+    def __init__(self):
+        self._labels = {}   # addr -> name
+        self._calls  = set()
+        self._jumps  = set()
+
+    def add_ref(self, addr, kind):
+        if kind == 'call':
+            self._calls.add(addr)
+        elif kind == 'jump':
+            self._jumps.add(addr)
+        hw = annotate_addr(addr)
+        if hw and addr not in self._labels:
+            self._labels[addr] = hw
+
+    def add_entry(self, addr):
+        self._labels[addr] = 'entry_point'
+
+    def finalize(self):
+        """Generate labels for all referenced addresses."""
+        for addr in self._calls:
+            if addr not in self._labels:
+                self._labels[addr] = f'sub_{addr:06X}'
+        for addr in self._jumps:
+            if addr not in self._labels:
+                self._labels[addr] = f'loc_{addr:06X}'
+
+    def get(self, addr):
+        return self._labels.get(addr)
+
+    def all_sorted(self):
+        return sorted(self._labels.items())
+
+# ============================================================
+# Pattern recognition (prologue/epilogue)
+# ============================================================
+
+def detect_pattern(data, pos):
+    """Return pattern string if a known pattern is detected at pos."""
+    if pos + 4 <= len(data):
+        # LINK XIY, N — function prologue
+        if data[pos] == 0xED and data[pos+1] == 0x0C:
+            n = s16(data, pos+2)
+            if n >= 0:
+                broken = ' !BROKEN' if n >= 5 else ''
+                return f'; --- function prologue (link XIY, {n}){broken} ---'
+        # UNLK XIY — function epilogue
+        if data[pos] == 0xED and data[pos+1] == 0x0D:
+            return '; --- function epilogue (unlk XIY) ---'
+    return None
+
+# ============================================================
+# Linear sweep disassembler
+# ============================================================
+
+def disassemble(data, base, start=None, end=None, init_labels=None):
+    """
+    Two-pass linear sweep.
+    Pass 1: collect all jump/call targets.
+    Pass 2: emit annotated asm.
+    Returns list of output lines.
+    init_labels: pre-populated LabelMap (e.g. entry_point from header)
+    """
+    if start is None: start = base
+    if end   is None: end   = base + len(data)
+
+    labels = init_labels if init_labels is not None else LabelMap()
+
+    # --- Pass 1: collect labels ---
+    pos = start - base
+    while pos < len(data) and (base + pos) < end:
+        cur_addr = base + pos
+        r = decode_one(data, pos, cur_addr, base)
+        if r is None:
+            pos += 1
+            continue
+        length, mnem, ops, refs, warn = r
+        for (ref_addr, kind) in refs:
+            labels.add_ref(ref_addr, kind)
+        pos += length if length > 0 else 1
+
+    labels.finalize()
+
+    # --- Pass 2: emit ---
+    lines = []
+    pos = start - base
+
+    while pos < len(data) and (base + pos) < end:
+        cur_addr = base + pos
+
+        # Emit label if this address is a target
+        lbl = labels.get(cur_addr)
+        if lbl:
+            lines.append(f'\n{lbl}:')
+
+        # Pattern detection comment
+        pat = detect_pattern(data, pos)
+        if pat:
+            lines.append(f'  {pat}')
+
+        r = decode_one(data, pos, cur_addr, base)
+        if r is None:
+            b = data[pos]
+            lines.append(f'0x{cur_addr:06X}: {b:02X}              db    0x{b:02X}  ; ?? undecodable')
+            pos += 1
+            continue
+
+        length, mnem, ops, refs, warn = r
+
+        # Format hex bytes
+        end_byte = min(pos + length, len(data))
+        hex_bytes = ' '.join(f'{data[i]:02X}' for i in range(pos, end_byte))
+
+        # Build instruction text
+        if ops:
+            instr = f'{mnem:<8} {ops}'
+        else:
+            instr = mnem
+
+        # Warning or cross-reference comment
+        if warn:
+            comment = f'  ; {warn}'
+        else:
+            comment = ''
+            for (ref_addr, kind) in refs:
+                lbl = labels.get(ref_addr)
+                if lbl:
+                    comment = f'  ; -> {lbl}'
+                    break
+
+        # Format: ADDR: hex   mnem ops  ; comment
+        hex_col = f'{hex_bytes:<16}'
+        lines.append(f'0x{cur_addr:06X}: {hex_col}  {instr}{comment}')
+
+        pos += length if length > 0 else 1
+
+    return lines
+
+# ============================================================
+# Main
+# ============================================================
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='NgpCraft NGPC/NGP Disassembler — TLCS-900 with NGPC annotations')
+    parser.add_argument('rom', help='ROM file (.ngc / .ngp / .bin)')
+    parser.add_argument('--base',  default=None, help='Override ROM base address (hex)')
+    parser.add_argument('--start', default=None, help='Start disassembly address (hex)')
+    parser.add_argument('--end',   default=None, help='End disassembly address (hex)')
+    parser.add_argument('-o', '--output', default=None, help='Output file (default: stdout)')
+    args = parser.parse_args()
+
+    with open(args.rom, 'rb') as f:
+        data = f.read()
+
+    # Parse ROM header
+    hdr = parse_header(data)
+    if hdr:
+        base  = hdr['base']
+        entry = hdr['entry']
+        title = hdr['title']
+        color = 'Color' if hdr['color'] else 'Monochrome'
+        lic   = 'Licensed' if hdr['licensed'] else 'SNK'
+    else:
+        base  = ROM_BASE
+        entry = ROM_BASE + HEADER_SIZE
+        title = '(no header)'
+        color = '?'
+        lic   = '?'
+
+    if args.base:
+        base = int(args.base, 16)
+    # Default start: skip header when ROM is detected (entry point or base+HEADER_SIZE)
+    if args.start:
+        start = int(args.start, 16)
+    elif hdr:
+        start = base + HEADER_SIZE  # skip header bytes — shown separately in banner
+    else:
+        start = base
+    end = int(args.end, 16) if args.end else base + len(data)
+
+    labels = LabelMap()
+    if hdr:
+        labels.add_entry(entry)
+
+    # Header banner
+    size_kb = len(data) / 1024
+    banner = [
+        '; ============================================================',
+        f'; NgpCraft Disassembler — {os.path.basename(args.rom)}',
+        f'; Title    : {title}',
+        f'; System   : NGPC {color}  ({lic})',
+        f'; ROM size : {len(data)} bytes ({size_kb:.1f} KB)',
+        f'; Base     : 0x{base:06X}',
+    ]
+    if hdr:
+        banner += [
+            f'; Entry    : 0x{entry:06X}',
+            f'; Soft ID  : 0x{hdr["sw_id"]:04X}',
+        ]
+    banner += [
+        '; ============================================================',
+        '',
+    ]
+    if hdr:
+        banner += [
+            '; --- ROM Header (64 bytes) ---',
+            f'0x{base:06X}: (header — 64 bytes, entry = 0x{entry:06X})',
+            '',
+        ]
+
+    lines = disassemble(data, base, start, end, init_labels=labels)
+
+    out_lines = banner + lines
+
+    out_text = '\n'.join(out_lines) + '\n'
+
+    if args.output:
+        with open(args.output, 'w', encoding='utf-8') as f:
+            f.write(out_text)
+        print(f'[ngpc_disasm] Written {len(out_lines)} lines to {args.output}')
+    else:
+        sys.stdout.write(out_text)
+
+
+if __name__ == '__main__':
+    main()
