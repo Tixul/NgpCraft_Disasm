@@ -13,7 +13,7 @@ Part of the [NgpCraft](https://github.com/ngpcraft) open-source toolchain.
 - **NGPC hardware register annotations** — joypad, VBlank vector, watchdog, K2GE, sprite VRAM, scroll planes, tile RAM
 - **BIOS SWI names** — `swi 1` → `BIOS_CLOCKGEARSET`, `swi 5` → `BIOS_SYSFONTSET`, etc.
 - **DMA LDC register names** — `DMAC0`, `DMAS0`, `DMAD0`, `DMAM1`… (58 instructions correctly annotated on *Ganbare Neo Poke-kun*)
-- **Broken opcode detection** — `D0` prefix, `CB` family, `link XIY, N≥5`, `adc W, B` with W>0 all flagged `; !BROKEN`
+- **Broken opcode detection** — `D0` prefix, `CB` family, `link XIY, N≥5`, `adc W, B` with W>0 all flagged `; !BROKEN` identified during toolchain development and validated through testing on real hardware.
 - **Two-pass label resolution** — `entry_point:`, `sub_2XXXXX:` (call targets), `loc_2XXXXX:` (jump targets) with `; -> sub_XXXXXX` cross-references on every call/jump
 - **Auto ROM header parsing** — detects title, entry point, color/mono, software ID from the 64-byte SNK/Toshiba header
 
