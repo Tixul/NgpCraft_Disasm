@@ -1197,18 +1197,16 @@ def _retmem_info(data, pos, mem):
                 return (4, f'({R32[r32_i2]}+{R8[r_i2]})', None)   # indexed by R8
         return (None, None, None)
 
-    # mem 20 — ARI_PD: pre-decrement (-r32), r32 specified in secondary byte
+    # mem 20 — ARI_PD: pre-decrement (-r32), r32 in bits[2:0] of secondary byte
     elif mem == 20:
         if not _safe(data, pos, 2): return (None, None, None)
-        r32_idx = (data[pos+1] & 0xFC) >> 2
-        if r32_idx >= len(R32): return (None, None, None)
+        r32_idx = data[pos+1] & 0x07
         return (2, f'(-{R32[r32_idx]})', None)
 
-    # mem 21 — ARI_PI: post-increment (r32+), r32 specified in secondary byte
+    # mem 21 — ARI_PI: post-increment (r32+), r32 in bits[2:0] of secondary byte
     elif mem == 21:
         if not _safe(data, pos, 2): return (None, None, None)
-        r32_idx = (data[pos+1] & 0xFC) >> 2
-        if r32_idx >= len(R32): return (None, None, None)
+        r32_idx = data[pos+1] & 0x07
         return (2, f'({R32[r32_idx]}+)', None)
 
     # mem >= 23 — register-source forms (C8+zz+r prefix) — should be routed to decode_zz_r

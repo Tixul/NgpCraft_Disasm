@@ -1,21 +1,24 @@
 # ngpc_disasm
 
-**TLCS-900/H disassembler for Neo Geo Pocket Color / Neo Geo Pocket ROMs**
+**TLCS-900/L1 disassembler for Neo Geo Pocket Color / Neo Geo Pocket ROMs**
 
-Single-file, zero-dependency Python disassembler for NGPC and NGP cartridges.
+Single-file, zero-dependency Python disassembler for NGPC and NGP cartridges.  
 Part of the [NgpCraft](https://github.com/ngpcraft) open-source toolchain.
+
+Implements the full TLCS-900/L1 instruction set from the official Toshiba TMP95C061BFG datasheet (ALT00146).
 
 ---
 
 ## Features
 
-- **Full TLCS-900/H decoder** — fixed opcodes, all prefix families (B0/C0/C8/D8/E8/F0/F8), indirect and immediate addressing, bit ops, shifts, block copy, multiply/divide
+- **Full TLCS-900/L1 decoder** — fixed opcodes, all prefix families (B0/C8/D8/E8), indirect and immediate addressing, bit ops, shifts, block ops, multiply/divide
+- **All addressing modes** — register-indirect, pre-decrement, post-increment, abs8/16/24, register+displacement, register-indexed
 - **NGPC hardware register annotations** — joypad, VBlank vector, watchdog, K2GE, sprite VRAM, scroll planes, tile RAM
 - **BIOS SWI names** — `swi 1` → `BIOS_CLOCKGEARSET`, `swi 5` → `BIOS_SYSFONTSET`, etc.
-- **DMA LDC register names** — `DMAC0`, `DMAS0`, `DMAD0`, `DMAM1`… (58 instructions correctly annotated on *Ganbare Neo Poke-kun*)
-- **Broken opcode detection** — `D0` prefix, `CB` family, `link XIY, N≥5`, `adc W, B` with W>0 all flagged `; !BROKEN` identified during toolchain development and validated through testing on real hardware.
+- **DMA LDC register names** — `DMAC0`, `DMAS0`, `DMAD0`, `DMAM1`…
+- **Broken opcode detection** — `D0` prefix, `CB` family, `LINK XIY, N≥5`, `ADC W, B` with W>0 all flagged `; !BROKEN`
 - **Two-pass label resolution** — `entry_point:`, `sub_2XXXXX:` (call targets), `loc_2XXXXX:` (jump targets) with `; -> sub_XXXXXX` cross-references on every call/jump
-- **Auto ROM header parsing** — detects title, entry point, color/mono, software ID from the 64-byte SNK/Toshiba header
+- **Auto ROM header parsing** — detects title, entry point, color/mono, software ID from the 64-byte SNK header
 
 ---
 
@@ -46,25 +49,27 @@ python ngpc_disasm.py ngp.bios --base 0xFF0000
 
 ```asm
 ; ============================================================
-; NgpCraft Disassembler — Stargunner.ngc
-; Title    : STARGUNNER
-; System   : NGPC Color  (Licensed)
-; ROM size : 81920 bytes (80.0 KB)
+; NgpCraft Disassembler — stargunner_j16.ngc
+; Title    : SHMUP
+; System   : NGPC Monochrome  (Licensed)
+; ROM size : 177420 bytes (173.3 KB)
 ; Base     : 0x200000
-; Entry    : 0x2079C5
+; Entry    : 0x200040
 ; ============================================================
 
 entry_point:
-0x2079C5: 2E                push     IZ
-0x2079C6: 1D D5 D0 20       call     0x20D0D5      ; -> sub_20D0D5
-0x2079CA: 1D A8 D1 20       call     0x20D1A8      ; -> sub_20D1A8
-0x2079D2: 1D 00 1D 21       call     0x211D00      ; -> sub_211D00
-0x2079E8: 1D F9 DF 20       call     0x20DFF9      ; -> sub_20DFF9
-0x2079EC: D2 BC 5E 00 20    ld       WA, (0x005EBC)
-0x2079F3: 66 04             jr       Z, 0x2079F9   ; -> loc_2079F9
+0x200040: 08 6F 4E          ldb      (HW_WATCHDOG), 0x4E
+0x200043: 47 00 60 00 00    ld       XSP, 0x00006000
+0x200048: 45 00 40 00 00    ld       XIY, 0x00004000
+0x20004D: 30 72 15          ld       WA, 0x1572
+0x200050: C8 E1             or       A, W
+0x200052: 66 16             jr       Z, 0x20006A   ; -> loc_20006A
 
-sub_20D0D5:
-0x20D0D5: C0 60 6F 82       ld       A, (HW_JOYPAD)  ; = 0x6F82
+loc_200054:
+0x200054: 28                push     WA
+0x200055: 21 00             ld       A, 0x00
+0x200057: BD 00 41          ld       (XIY+0), A
+0x20005A: ED 61             inc      1, XIY
 ```
 
 ---
@@ -73,13 +78,13 @@ sub_20D0D5:
 
 Tested against real NGPC cartridges:
 
-| ROM | Size | Unknown rate | Notes |
-|-----|------|-------------|-------|
-| Stargunner *(homebrew, CC900)* | 80 KB | 8.5% | Source code available — all unknowns are data |
-| Delta Warp *(official)* | 512 KB | 9.1% | All unknowns are graphics tiles |
-| Ganbare Neo Poke-kun *(official, 2 MB)* | 2 MB | 6.7% | Heaviest DMA usage — all 58 `ldc` correctly annotated |
+| ROM | Size | Notes |
+|-----|------|-------|
+| Stargunner *(homebrew, NgpCraft)* | 173 KB | Source available — all unknowns are data |
+| Dark Arms Beast Buster *(SNK, official)* | 2 MB | CC900-compiled — all code correctly aligned |
+| Delta Warp *(official)* | 512 KB | All unknowns are graphics tiles |
 
-Unknown bytes are always data sections (tiles, strings, jump tables) — no missing code opcodes.
+Unknown bytes in code regions are always data sections (tiles, strings, jump tables) — no missing code opcodes.
 
 ---
 
@@ -97,15 +102,43 @@ All addresses accept hex (`0x200040`) or decimal.
 
 ---
 
+## Instruction Coverage
+
+| Category | Instructions |
+|----------|-------------|
+| Fixed opcodes | `NOP`, `RET`, `RETI`, `RETD`, `EI`, `DI`, `HALT`, `PUSH/POP SR/A/F`, `LDF`, `INCF`, `DECF`, `SWI 0-7`, `LDX`, `CALR`, `JP`, `CALL` |
+| Load immediate | `LD R8/R16/R32, #imm` |
+| Stack | `PUSH`/`POP` R16/R32 |
+| Branches | `JR cc, d8`, `JRL cc, d16`, `CALR d16`, `DJNZ`, `SCC` |
+| C8+zz+r ALU | `ADD`, `ADC`, `SUB`, `SBC`, `AND`, `XOR`, `OR`, `CP`, `LD`, `INC`, `DEC`, `CPL`, `NEG`, `EXTZ`, `EXTS`, `DAA` |
+| E8+r special | `LINK`, `UNLK`, `EXTZ`, `EXTS` |
+| Indirect loads | `LD R, (r32)`, `LD R, (r32+d8)`, `LD R, (abs8/16/24)`, `LD R, (-r32)`, `LD R, (r32+)` |
+| Indirect stores | `LD (r32+d8), R`, `LD (abs16/24), R`, `LD (mem), #imm` |
+| B0+mem forms | `JP/CALL cc, (mem)`, `LD (mem), R`, `LDA R, (mem)`, `LDAR`, `POP/POPW (mem)` |
+| Bit manipulation | `BIT`, `RES`, `SET`, `CHG`, `TSET`, `ANDCF`, `ORCF`, `XORCF`, `LDCF`, `STCF` |
+| Shifts/rotates | `RLC`, `RRC`, `RL`, `RR`, `SLA`, `SRA`, `SLL`, `SRL` (register and memory forms) |
+| Block ops | `LDI`, `LDIR`, `LDD`, `LDDR`, `CPI`, `CPIR`, `CPD`, `CPDR`, `LDIW`, `LDIRW` |
+| Multiply/Divide | `MUL`, `MULS`, `DIV`, `DIVS` (register and immediate forms) |
+| LDC | `LDC cr, r` / `LDC r, cr` with DMA register names (`DMAC0`, `DMAS0`…) |
+| RLD/RRD | Rotate digit through accumulator |
+
+---
+
 ## NgpCraft Toolchain
 
 | Tool | Purpose |
 |------|---------|
-| `t900as.py` | TLCS-900/H assembler |
+| `t900as.py` | TLCS-900/L1 assembler |
 | `ngpc_romtool.py` | ROM packer / header inspector |
 | `ngpc_disasm.py` | This disassembler |
 
 The output format is designed to be compatible with `t900as.py` for round-trip study (disassemble → edit → re-assemble).
+
+---
+
+## Reference
+
+Instruction set from the official Toshiba **TMP95C061BFG** datasheet (ALT00146, publicly available on Mouser and Toshiba). NGPC hardware annotations from `HW_REGISTERS.md` and silicon testing notes.
 
 ---
 

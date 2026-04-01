@@ -2,7 +2,8 @@
 
 **NgpCraft NGPC/NGP Disassembler**  
 Single-file Python disassembler for Neo Geo Pocket Color / Neo Geo Pocket ROMs.  
-Full TLCS-900/H decoder with NGPC-specific hardware register annotations.
+Full TLCS-900/L1 decoder with NGPC-specific hardware register annotations.  
+Implements the official Toshiba TMP95C061BFG datasheet (ALT00146).
 
 Released under the **MIT License** — free to use, modify, and redistribute.  
 Part of the [NgpCraft](https://github.com/ngpcraft) open-source toolchain.
@@ -64,10 +65,9 @@ All addresses accept hex (`0x200040`) or decimal notation.
 0x200000: (header — 64 bytes, entry = 0x200040)
 
 entry_point:
-0x200040: D8 8E             ld       XIZ, XWA
-0x200042: D8 D8             cp       XWA, 0
-0x200044: 65 0A             jr       MI, 0x200050
-0x200046: 1E A5 F1          calr     0x2011EE       ; -> sub_2011EE
+0x200040: 08 6F 4E          ldb      (HW_WATCHDOG), 0x4E
+0x200043: 47 00 60 00 00    ld       XSP, 0x00006000
+0x200048: 06 00             ei       0
 ```
 
 ### Line format
@@ -95,7 +95,7 @@ Labels are generated automatically:
 |--------|---------|
 | `entry_point:` | ROM entry point (from header) |
 | `sub_2XXXXX:` | Target of a `call`/`calr` instruction |
-| `loc_2XXXXX:` | Target of a `jp`/`jr`/`jrl` instruction |
+| `loc_2XXXXX:` | Target of a `jp`/`jr`/`jrl`/`djnz` instruction |
 
 Labels appear on the line immediately before the labeled instruction, and call/jump operands include a cross-reference comment: `; -> sub_200100`.
 
@@ -109,8 +109,8 @@ Any instruction that references a known NGPC hardware address is annotated autom
 
 ```asm
 0x200100: C1 82 6F 21    ld     A, (HW_JOYPAD)       ; = 0x6F82
-0x200108: F1 CC 6F 40 67 ldw    (VBL_VECTOR_LO), WA  ; = 0x6FCC
-0x200114: C1 6F 00 20    ld     A, (HW_WATCHDOG)      ; = 0x006F
+0x200108: F2 CC 6F 40 67 ldw    (VBL_VECTOR_LO), WA  ; = 0x6FCC
+0x200114: 08 6F 4E       ldb    (HW_WATCHDOG), 0x4E  ; = 0x006F
 ```
 
 ### Known registers
@@ -167,63 +167,75 @@ Any instruction that references a known NGPC hardware address is annotated autom
 Instructions that are **known to crash or hang on NGPC silicon** are annotated with `; !BROKEN`:
 
 ```asm
-0x200100: D0 61    inc   8, WA    ; !BROKEN D0 word-reg ALU prefix (NGPC silicon bug)
-0x200102: CB 81    add   A, C     ; !BROKEN — CB family broken on NGPC
+0x200100: D0 61    inc   8, WA    ; !BROKEN D0..D7 ALU (word-reg prefix)
 ```
 
-### Known broken opcodes
+### Known broken opcodes on NGPC silicon
 
 | Opcode(s) | Issue |
 |-----------|-------|
 | `D0 xx` | D0 prefix (all sub-ops) — hangs watchdog |
-| `CB xx` | Entire CB family — causes infinite loop |
+| `D1..D7 xx` (ALU sub-ops) | Word-register ALU — broken (but D1/D2-D5 as abs-address loads are **safe**) |
+| `CB xx` | Entire CB opcode family — causes infinite loop |
 | `LINK XIY, N` where N≥5 | Stack frame too large — corrupts SP |
 | `ADC W, B` when W > 0 | ADC high byte produces wrong result |
 
-> **Note:** `D1` as abs16 load (`LD R16, (abs16)`) is **safe** and will decode normally without a warning. Similarly, `D2..D7` used as abs-address memory loads are safe and decode without warning.
+> **Note:** `D1` as abs16 load (`LD R16, (abs16)`) and `D2–D5` used as abs-address memory loads (`LD R16, (abs24)`, `LD R16, (r32)`, etc.) are **safe** and decode normally without a warning.
 
 ---
 
 ## Instruction Coverage
 
-The decoder handles the full TLCS-900/H instruction set as used on NGPC:
+The decoder handles the full TLCS-900/L1 instruction set as documented in the TMP95C061BFG datasheet:
 
-| Category | Examples |
-|----------|---------|
-| Fixed opcodes | `NOP`, `RET`, `RETI`, `RETD`, `EI`, `DI`, `HALT`, `SWI` |
-| Flag ops | `RCF`, `SCF`, `CCF`, `ZCF`, `INCF`, `DECF`, `EX F,F'`, `LDF` |
-| SR/A/F stack | `PUSH`/`POP` `SR`, `A`, `F` |
+| Category | Instructions |
+|----------|-------------|
+| Fixed opcodes | `NOP`, `RET`, `RETI`, `RETD d16`, `EI n`, `DI`, `HALT`, `LDX`, `CALR d16`, `JP`, `CALL` |
+| Flag / SR ops | `RCF`, `SCF`, `CCF`, `ZCF`, `INCF`, `DECF`, `LDF n`, `EX F,F'`, `PUSH`/`POP` SR/A/F |
 | Load immediate | `LD R8, #imm8` / `LD R16, #imm16` / `LD R32, #imm32` |
-| Stack | `PUSH`/`POP` R16/R32, `PUSHW #imm16`, `PUSH #imm8` |
-| Branches | `JP`, `CALL`, `JR cc, d8`, `JRL cc, d16`, `CALR d16` |
-| C8+zz+r ALU | `ADD`, `SUB`, `AND`, `XOR`, `OR`, `CP`, `LD`, `INC`, `DEC` |
-| E8+r special | `LINK`, `UNLK`, `EXTZ`, `EXTS`, `DJNZ` |
-| Indirect loads | `LD R, (r32+d8)`, `LD R, (abs16)`, `LD R, (abs24)` |
-| Indirect stores | `LD (r32+d8), R`, `LD (abs16), R`, `LD (abs16), #imm` |
-| Post-inc/pre-dec | `LD (r32+), R8`, `LD R8, (r32+)` |
-| B0+mem forms | `JP/CALL cc, (mem)`, `LD (mem), R`, `LDA R, (mem)`, bit ops |
-| Bit manipulation | `BIT`, `RES`, `SET`, `CHG`, `TSET`, `ANDCF`/`ORCF`/`XORCF` |
-| Shifts/rotates | `RLC`, `RRC`, `RL`, `RR`, `SLA`, `SRA`, `SLL`, `SRL` |
-| Block copy | `LDIW`, `LDIRW` |
-| LDC | `LDC cr, r` / `LDC r, cr` with DMA register names |
-| Multiply/Divide | `MUL`, `MULS`, `DIV`, `DIVS` |
+| Stack | `PUSH`/`POP` R16/R32 |
+| Branches | `JR cc, d8`, `JRL cc, d16`, `DJNZ r, d8`, `SCC cc, r` |
+| Register ALU | `ADD`, `ADC`, `SUB`, `SBC`, `AND`, `XOR`, `OR`, `CP` (R,r and R,#imm) |
+| Register ops | `LD R,r`, `INC`, `DEC`, `CPL`, `NEG`, `EXTZ`, `EXTS`, `DAA` |
+| Stack frame | `LINK r32, d16`, `UNLK r32` |
+| Indirect loads | `LD R, (r32)`, `(r32+d8)`, `(-r32)`, `(r32+)`, `(abs8)`, `(abs16)`, `(abs24)`, `(r32+R)`, `(r32+d16)` |
+| Indirect stores | `LD (r32+d8), R`, `LD (mem), R` (all register sizes), `LD (mem), #imm` |
+| B0+mem forms | `JP/CALL cc, (mem)`, `LDA R, (mem)`, `LDAR R, $+d16`, `POP/POPW (mem)` |
+| Bit manipulation | `BIT`, `RES`, `SET`, `CHG`, `TSET`, `ANDCF`, `ORCF`, `XORCF`, `LDCF`, `STCF` |
+| Shifts/rotates | `RLC`, `RRC`, `RL`, `RR`, `SLA`, `SRA`, `SLL`, `SRL` (register, immediate count, and memory forms) |
+| Block copy/compare | `LDI`, `LDIR`, `LDD`, `LDDR`, `CPI`, `CPIR`, `CPD`, `CPDR`, `LDIW`, `LDIRW` |
+| Multiply/Divide | `MUL RR, r` / `MUL RR, #imm`, `MULS`, `DIV`, `DIVS` (register and immediate forms) |
+| RLD/RRD | Rotate BCD digit through accumulator |
+| LDC | `LDC cr, r` / `LDC r, cr` — DMA registers annotated (`DMAC0`, `DMAS0`, `DMAD0`, `DMAM0`…) |
+
+---
+
+## ROM Header
+
+NGPC ROMs have a 64-byte header at `0x200000`:
+
+| Offset | Size | Content |
+|--------|------|---------|
+| `0x00` | 28 | Copyright string (`COPYRIGHT BY SNK CORPORATION` or ` LICENSED BY SNK CORPORATION`) |
+| `0x1C` | 4 | Entry point (32-bit LE) |
+| `0x20` | 2 | Software ID (BCD) |
+| `0x22` | 1 | Color/mono flag: `0x00` = NGP mono, `0x10` = NGPC color |
+| `0x23` | 1 | Reserved |
+| `0x24` | 12 | Title (ASCII, space-padded) |
+| `0x30` | 16 | Reserved (zeros) |
+
+The disassembler auto-detects this header and uses the entry point, title, and color flag automatically.
 
 ---
 
 ## Understanding the Output
-
-### Function boundaries
-
-The disassembler detects `LINK`/`UNLK` prologue/epilogue patterns from the NgpCraft toolchain. These appear as function delimiters in the output.
-
-For CC900-compiled code (official toolchain), function boundaries are identified by call/return patterns and label detection rather than `link`/`unlk` (CC900 doesn't use these).
 
 ### Linear sweep limitations
 
 The disassembler uses **linear sweep** — it decodes bytes sequentially from the start address. This means:
 
 - **Jump tables** may be decoded as instructions (they aren't). Look for runs of `db` bytes between valid instruction sequences.
-- **Data sections** embedded in code (e.g., ROM strings) will produce garbage instructions before the next real code.
+- **Data sections** embedded in code (e.g., ROM strings) will produce spurious instructions before the next real code.
 - Use `--start` and `--end` to focus on known code regions.
 
 ### Unknown bytes
@@ -237,31 +249,29 @@ Bytes that cannot be decoded appear as:
 This usually means:
 1. The byte is part of a data table (jump target offsets, strings, graphics data)
 2. The preceding instruction was decoded with wrong length, breaking alignment
-3. A genuinely rare/unused opcode
+3. A genuinely rare/unused opcode (undefined slots per datasheet)
+
+### Function boundaries
+
+The disassembler detects `LINK`/`UNLK` prologue/epilogue patterns from the NgpCraft toolchain. These appear as natural function delimiters in the output.
+
+For CC900-compiled code (official SNK toolchain), function boundaries are identified by call/return patterns and label detection.
 
 ---
 
 ## Working with Real ROMs
 
-### NGPC color ROM
+### NGPC color or mono ROM
 
 ```bash
 python ngpc_disasm.py game.ngc
 ```
 
-The disassembler auto-detects the NGPC ROM header and:
+The disassembler auto-detects the ROM header and:
 - Skips the 64-byte header (shown as a comment)
 - Sets base address to `0x200000`
-- Uses the header's entry point as the start address
+- Uses the header entry point as the start address
 - Reports title, color/mono, and software ID
-
-### NGP mono ROM
-
-```bash
-python ngpc_disasm.py game.ngp
-```
-
-Same as above, `System: NGP Mono`.
 
 ### Raw binary (no header)
 
@@ -277,65 +287,25 @@ If no valid ROM header is detected, the file is treated as raw binary starting a
 python ngpc_disasm.py ngp.bios --base 0xFF0000
 ```
 
-The NGPC BIOS occupies `0xFF0000–0xFFFFFF` (64 KB). Use the appropriate base.
-
----
-
-## Output File
-
-```bash
-python ngpc_disasm.py game.ngc -o game.asm
-```
-
-The output file uses the same format as stdout. It can serve as a starting point for:
-- Re-assembly with `t900as.py` (NgpCraft toolchain)
-- Study and annotation in a text editor
-- Diff-based comparison between ROM versions
-
----
-
-## Example: Entry Point Analysis
-
-```bash
-python ngpc_disasm.py Stargunner.ngc --start 0x2079C5 --end 0x207A60
-```
-
-Output (excerpt):
-
-```asm
-entry_point:
-0x2079C5: 2E                push     IZ
-0x2079C6: 1D D5 D0 20       call     0x20D0D5      ; -> sub_20D0D5
-0x2079CA: 1D A8 D1 20       call     0x20D1A8      ; -> sub_20D1A8
-0x2079CE: 1D EA F5 20       call     0x20F5EA      ; -> sub_20F5EA
-0x2079D2: 1D 00 1D 21       call     0x211D00      ; -> sub_211D00
-...
-0x2079E6: DE AC             ld       XIZ, 4
-0x2079E8: 1D F9 DF 20       call     0x20DFF9      ; -> sub_20DFF9
-0x2079EC: D2 BC 5E 00 20    ld       WA, (0x005EBC)
-0x2079F1: D8 DC             cp       XWA, 4
-0x2079F3: 66 04             jr       Z, 0x2079F9   ; -> loc_2079F9
-```
+The NGPC BIOS occupies `0xFF0000–0xFFFFFF` (64 KB).
 
 ---
 
 ## Known Limitations
 
-- **Linear sweep only** — no recursive descent. Data-embedded-in-code sections may confuse the decoder.
-- **No symbol import** — labels are auto-generated (`sub_XXXXXX`, `loc_XXXXXX`). No way to import a symbol table yet.
-- **D0 family** — decoded for annotation but always flagged as BROKEN (correct behavior for NGPC).
-- **LDAR** — decoded but rare; relative addressing is shown as absolute computed address.
-- **ARI mode 3 complex forms** — decoded when r32 index is in range; invalid combinations fall back to `db`.
+- **Linear sweep only** — no recursive descent. Data sections embedded in code may confuse the decoder.
+- **No symbol import** — labels are auto-generated (`sub_XXXXXX`, `loc_XXXXXX`). No way to import a symbol table.
+- **D0 family** — decoded for annotation purposes but always flagged as BROKEN (correct behavior for NGPC silicon).
+- **ARI mode 3 complex forms** — decoded when r32 index is in valid range; invalid combinations (which are data bytes) fall back to `db`.
+- **Undefined opcodes** — slots that are blank in the datasheet Appendix C instruction map (e.g., `0x58–0x5F` in the `b < 0x80` range) are emitted as `db`.
 
 ---
 
 ## Toolchain Integration
 
-This disassembler is part of the NgpCraft toolchain:
-
 | Tool | Purpose |
 |------|---------|
-| `t900as.py` | TLCS-900 assembler (source of truth for opcode encoding) |
+| `t900as.py` | TLCS-900/L1 assembler (source of truth for opcode encoding) |
 | `ngpc_romtool.py` | ROM packer / header inspector |
 | `ngpc_disasm.py` | This disassembler |
 
