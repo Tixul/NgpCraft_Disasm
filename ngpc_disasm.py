@@ -4,7 +4,7 @@ ngpc_disasm.py — NGPC/NGP Disassembler
 Part of the NgpCraft open-source toolchain for Neo Geo Pocket Color.
 
 MIT License
-Copyright (c) 2026 NgpCraft contributors
+Copyright (c) 2026 NgpCraft Tixu
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
 in the Software without restriction, including without limitation the rights
@@ -30,7 +30,34 @@ Usage:
   python ngpc_disasm.py rom.ngc --start 0x200040 --end 0x200200
   python ngpc_disasm.py rom.ngc -o output.asm
 
-Sources: t900as.py (encoder), ngdis-master (reference C decoder),
+Architecture — two-pass linear sweep:
+  Pass 1 (disassemble, label collection): decode each instruction, collect all
+    CALL/JP target addresses into LabelMap. Unknown bytes → 1-byte step.
+  Pass 2 (emit): re-decode with label lookup. Emit address, hex bytes, mnemonic,
+    optional annotation comment (HW register name, silicon warning, cross-ref).
+
+Decode dispatch (decode_one):
+  1. decode_fixed   — single-byte opcodes + short fixed patterns (NOP, RET, EI…)
+  2. decode_xx      — 0x20..0x7F range (LD imm, PUSH, POP, JR, JRL, LD R32 imm32)
+  3. decode_B0_mem  — zz==3 prefix (0xB0..0xFF) → abs-store, RET cc, indirect JP/CALL
+  4. decode_zz_r    — mem>=23 (C8+zz+r family): ALU on registers, LINK, UNLK, LDC, shifts
+  5. decode_zz_mem  — mem<=21: indirect/abs loads and stores, LDIW, LDIRW
+
+NGPC silicon bugs annotated inline:
+  D0..D7 as ALU word-register prefix   → broken (all uses)
+  LINK XIY, N with N >= 5              → broken
+  See also: T900_DENSE_REF.md §41, silicon_bugs.md
+
+LDC encoding (TLCS-900/L1 catalog ALT00146, pattern 1 1 z z 1 r r r):
+  C8+r  zz=00 → byte  register (R8,  ldcb)   0xC8+r
+  D8+r  zz=01 → word  register (R16, ldcw)   0xD8+r   ← D0+r (zz=00,bit3=0) is broken!
+  E8+r  zz=10 → lword register (R32, ldcl)   0xE8+r
+  NOTE: in the ALU-register-source context (C8/D8/E8 prefix before ALU sub-byte),
+  D8..DF selects R32 operand (not R16). Only the LDC sub-byte (0x2E/0x2F) uses
+  D8 to mean R16. The disassembler shows register by _zz_regs() (ALU convention),
+  so LDC D8 2E cr appears as "ldc CR, XWA" — functionally correct (WA ⊂ XWA).
+
+Sources: t900as.py (encoder), TMP95C061BFG datasheet (Toshiba, ALT00146),
          HW_REGISTERS.md, BIOS_REF.md, ngpc_romtool.py, silicon notes.
 """
 
@@ -183,15 +210,20 @@ def _safe(data, i, n=1):
     return i + n <= len(data)
 
 # ============================================================
-# Broken opcode detection
+# Broken opcode detection helpers
 # ============================================================
 
 def _is_broken_d0_family(b, context='alu'):
-    """D0-D7 as ALU word-register source prefix = BROKEN on NGPC silicon."""
+    """D0-D7 as ALU word-register source prefix = BROKEN on NGPC silicon.
+    NOTE: this helper is NOT called from the main decode path; the broken flag
+    is set inline in _zz_regs() and decode_zz_mem(). Kept as explicit predicate
+    for external callers that may need to query broken-ness without decoding."""
     return 0xD0 <= b <= 0xD7 and context == 'alu'
 
 def check_broken_link(n):
-    """LINK XIY, N with N >= 5 is broken on NGPC silicon."""
+    """LINK XIY, N with N >= 5 is broken on NGPC silicon.
+    CC900 always uses N=0 (link XIY, 0); our toolchain enforces N<=4 max.
+    Bisect validation: z10(N=8)/z11(N=6)/z12(N=5) all failed on real hardware."""
     return n >= 5
 
 # ============================================================
@@ -420,12 +452,12 @@ def decode_xx(data, pos, cur_addr, base):
 
     if grp == 0x50:
         # SCC cc, r  (set-on-condition — not common in NGPC code)
-        # Note: ngdis shows 0x50-0x57 as SCC in some contexts
+        # Note: datasheet §4.2 table shows 0x50-0x57 as POP R32 in this context
         return (1, 'pop', R32[r], refs, warn)  # actually POP R32 in our assembler
 
     if grp == 0x58:
-        # POP R32
-        return (1, 'pop', R32[r], refs, warn)
+        # Undefined opcode range per datasheet Appendix C instruction code map
+        return None
 
     # JR / JRL — handled by bit pattern
     if (b & 0x70) == 0x70:
@@ -457,27 +489,49 @@ def decode_xx(data, pos, cur_addr, base):
     return None
 
 # ============================================================
-# decode_zz_r — C8+zz+r prefix family (ALU on registers, LINK, UNLK, etc.)
-# Covers: 0xC8..0xCF (byte), 0xD0..0xD7 (word, BROKEN), 0xD8..0xDF (long),
-#         0xE8..0xEF (E8+r32 special)
+# decode_zz_r — C8+zz+r prefix family (ALU on registers, LINK, UNLK, LDC, shifts)
+#
+# Prefix byte layout in ALU-register context:
+#   C8..CF  (1100 1rrr) : byte  operand — R8  source  → sz='b', safe
+#   D0..D7  (1101 0rrr) : word  operand — R16 source  → sz='w', BROKEN on NGPC silicon
+#   D8..DF  (1101 1rrr) : lword operand — R32 source  → sz='l', safe
+#   E8..EF  (1110 1rrr) : lword (alt)   — R32 source  → sz='l', safe (extz, LDIRW…)
+#   C7      (1100 0111) : extended bank register prefix (bank_idx byte follows)
+#
+# LDC sub-encoding note (when second byte is 0x2E/0x2F):
+#   In the LDC instruction encoding (catalog ALT00146 §4, pattern 1 1 z z 1 r r r),
+#   D8+r means R16 (word) and E8+r means R32 (long word). This differs from the ALU
+#   register context where D8+r selects R32. The disassembler uses _zz_regs() for both
+#   and will therefore show "ldc CR, XWA" for a D8 2E cr sequence (CC900 ldcw DMAC0,WA).
+#   Functionally equivalent: WA is the low word of XWA. For correctness, use E8 (ldcl
+#   with R32=XWA) for 32-bit registers (DMAS/DMAD), and D8 (ldcw with WA displayed as
+#   XWA by this disassembler) is safe for 16-bit registers (DMAC/DMAM).
 # ============================================================
 
 def _zz_regs(b):
     """Returns (size_str, reg_name, is_broken) for C8+zz+r / E8+r prefix byte.
-    Note: 0xC7/0xCF/0xD7/0xDF/0xE7/0xEF have r=7 → extended register (next byte = reg index).
-    These are handled separately via EXTENDED_REG sentinel.
+
+    In ALU-register context:
+      C8..CF → ('b', R8[r],  False)  byte  register, safe
+      D0..D7 → ('w', R16[r], True)   word  register, BROKEN on NGPC silicon
+      D8..DF → ('l', R32[r], False)  lword register, safe (R32, not R16!)
+      E8..EF → ('l', R32[r], False)  lword register, safe
+      C7     → ('b', None,   False)  extended bank-reg prefix, r=None sentinel
+
+    See module docstring for the LDC context asymmetry (D8 = R16 for LDC encoding
+    but this function returns R32 — both naming conventions refer to the same bits).
     """
     if 0xC8 <= b <= 0xCF:
         return ('b', R8[b & 7], False)
     if 0xD0 <= b <= 0xD7:
-        return ('w', R16[b & 7], True)   # BROKEN on NGPC!
+        return ('w', R16[b & 7], True)   # BROKEN on NGPC silicon (D0..D7 ALU prefix)
     if 0xD8 <= b <= 0xDF:
-        return ('l', R32[b & 7], False)  # Long (NOT word despite getzz=1 in ngdis)
+        return ('l', R32[b & 7], False)  # ALU lword source — R32 (XWA…XSP)
     if 0xE8 <= b <= 0xEF:
-        return ('l', R32[b & 7], False)
-    # 0xC7 / extended register prefix (getmem(0xC7)=23 → routes to decode_zz_r)
+        return ('l', R32[b & 7], False)  # E8 family: extz, LDIRW, etc.
+    # 0xC7 — extended bank register prefix; _getmem(0xC7)=23 routes here
     if b == 0xC7:
-        return ('b', None, False)   # None = extended, next byte is reg index
+        return ('b', None, False)   # None = extended, next byte = bank_idx
     return (None, None, False)
 
 def _imm_for_size(sz):
@@ -537,6 +591,20 @@ def decode_zz_r(data, pos, cur_addr, base):
         return None
 
     # ---- Single-op instructions (second byte is exact) ----
+    # ---- MUL/DIV immediate (second byte 0x08-0x0B, imm follows) ----
+    # Dest = wide register (one size up), from prefix r field
+    if c in (0x08, 0x09, 0x0A, 0x0B):
+        mnem = ('mul', 'muls', 'div', 'divs')[c - 0x08]
+        dr = R16[b & 7] if sz == 'b' else R32[b & 7]
+        if sz == 'b':
+            if not _safe(data, pos, 3): return None
+            imm = data[pos + 2]
+            return (3, mnem, f'{dr}, 0x{imm:02X}', refs, warn)
+        else:
+            if not _safe(data, pos, 4): return None
+            imm = u16(data, pos + 2)
+            return (4, mnem, f'{dr}, 0x{imm:04X}', refs, warn)
+
     if c == 0x04:
         return (2, 'push', reg, refs, warn)
     if c == 0x05:
@@ -574,14 +642,21 @@ def decode_zz_r(data, pos, cur_addr, base):
         return (3, 'djnz', f'{reg}, 0x{target:06X}', refs, warn)
 
     if c == 0x2E:
-        # LDC cr, r  (write CR)
+        # LDC cr, r  (write CR) — encoding: [prefix][0x2E][cr_num]
+        # prefix: C8+r=ldcb(R8), D8+r=ldcw(R16→shown as R32 here), E8+r=ldcl(R32)
+        # D0+r (broken!) was the old t900as.py bug (zz=0x08 → D0). Fixed: zz=0x10→D8, zz=0x20→E8.
+        # CC900 uses: E8 2E cr for DMAS/DMAD (32-bit source/dest addr)
+        #             D8 2E cr for DMAC (16-bit count, displayed as XWA — see module docstring)
+        #             C9 2E cr for DMAM (8-bit mode, A register)
         if not _safe(data, pos, 3): return None
         cr = data[pos+2]
         cr_nm = CR_NAMES.get(cr, f'CR_0x{cr:02X}')
         return (3, 'ldc', f'{cr_nm}, {reg}', refs, warn)
 
     if c == 0x2F:
-        # LDC r, cr  (read CR)
+        # LDC r, cr  (read CR) — encoding: [prefix][0x2F][cr_num]
+        # Reads CR into register. D0 2F cr (read with R16/WA) is also broken on NGPC
+        # if D0 prefix is used. Safe: use ldcb for R8, or ldcl+extz for R32.
         if not _safe(data, pos, 3): return None
         cr = data[pos+2]
         cr_nm = CR_NAMES.get(cr, f'CR_0x{cr:02X}')
@@ -695,24 +770,59 @@ def decode_zz_r(data, pos, cur_addr, base):
         cc_idx = c & 0x0F
         return (2, 'scc', f'{CC[cc_idx]}, {reg}', refs, warn)
 
-    # ---- MUL/DIV ----
-    if 0x40 <= c <= 0x47: return (2, 'mul',  f'{dest_reg(c & 7)}, {reg}', refs, warn)
-    if 0x48 <= c <= 0x4F: return (2, 'muls', f'{dest_reg(c & 7)}, {reg}', refs, warn)
-    if 0x50 <= c <= 0x57: return (2, 'div',  f'{dest_reg(c & 7)}, {reg}', refs, warn)
-    if 0x58 <= c <= 0x5F: return (2, 'divs', f'{dest_reg(c & 7)}, {reg}', refs, warn)
+    # ---- MUL/DIV (register form) — dest is one size wider than source ----
+    # sz='b' → R16 dest, sz='w' → R32 dest (datasheet §5 MUL/DIV)
+    def wide_reg(idx): return R16[idx] if sz == 'b' else R32[idx]
+    if 0x40 <= c <= 0x47: return (2, 'mul',  f'{wide_reg(c & 7)}, {reg}', refs, warn)
+    if 0x48 <= c <= 0x4F: return (2, 'muls', f'{wide_reg(c & 7)}, {reg}', refs, warn)
+    if 0x50 <= c <= 0x57: return (2, 'div',  f'{wide_reg(c & 7)}, {reg}', refs, warn)
+    if 0x58 <= c <= 0x5F: return (2, 'divs', f'{wide_reg(c & 7)}, {reg}', refs, warn)
 
     return None  # unrecognized
 
 # ============================================================
-# decode_zz_mem — indirect and abs16 forms
-# Covers: (r32+d8) loads/stores, abs16 via C1/D1, post-inc, LDIW, LDIRW
+# decode_zz_mem — indirect and abs16 load/store forms
+#
+# For bytes 0x80..0xFF (excluding the zz==3/B0_mem group), the first byte encodes
+# both the memory addressing mode and the data size (zz):
+#
+#   First byte layout: s z z m m m m m
+#     s      = bit 7 (always 1 in this group)
+#     zz     = bits [5:4] — data size: 00=byte, 01=word, 10=lword
+#     mmmmm  = _getmem() — addressing mode index 0..21
+#
+# _getmem(b): extracts the 5-bit mem mode from bits [6,3:0]:
+#   mm = b & 0x4F  (mask out bits [5:4] = zz, keep bit6 and bits[3:0])
+#   mem = ((mm & 0x40) >> 2) | (mm & 0x0F)  → 0..21
+#
+# mem mode table (see _retmem_info):
+#   0..7   → (r32)          ARI: indirect via XWA..XSP
+#   8..15  → (r32+d8)       ARID: indirect with signed 8-bit displacement
+#   16     → (abs8)         ABS_B: 1-byte absolute address
+#   17     → (abs16)        ABS_W: 2-byte absolute address (C1, D1, E1 prefixes)
+#   18     → (abs24)        ABS_L: 3-byte absolute address
+#   19     → ARI secondary  various r32+offset/index modes
+#   20     → (-r32)         ARI_PD: pre-decrement
+#   21     → (r32+)         ARI_PI: post-increment
+#   >=23   → C8+zz+r        register source → routed to decode_zz_r
+#
+# Special hard-coded patterns (checked before general dispatch):
+#   0x84 0x10        → LDIW  (XDE+),(XHL+)  — single word copy (NGPC: XIY/XIX)
+#   0x95 0x11        → LDIRW (XDE+),(XHL+)  — repeat word copy (NGPC: XIY/XIX)
+#   0xD2..0xD5 LD    → safe CC900 abs-load patterns (tried before broken D0-D7 handler)
+#   0xD0..0xD7 other → broken D0..D7 ALU word-register prefix handler
+#   0xC1/0xD1/0xE1   → abs16 byte/word/lword loads (safe — these are mem forms, not ALU prefix)
 # ============================================================
 
 def _getmem(b):
+    """Extract 5-bit memory mode from first byte of an indirect instruction.
+    Layout: bit6 → bit4 of result, bits[3:0] → bits[3:0] of result.
+    Values 0..21 = memory addressing modes; >=23 = register source (→ decode_zz_r)."""
     mm = b & 0x4F
     return ((mm & 0x40) >> 2) | (mm & 0x0F)
 
 def _getzz_mem(b):
+    """Extract 2-bit data-size field from first byte: bits[5:4] → 00=byte, 01=word, 10=lword."""
     return (b & 0x30) >> 4
 
 def decode_zz_mem(data, pos, cur_addr, base):
@@ -830,7 +940,7 @@ def decode_zz_mem(data, pos, cur_addr, base):
     # 0xB8..0xBF d8 op
     # 0x30..0x37 → LD (r32+d8), R16 or R32
     # 0x31..0x38 → LD (r32+d8), R8 (different base in our assembler)
-    # 0x50..0x57 → LD (r32+d8), R16 (ngdis convention)
+    # 0x50..0x57 → LD (r32+d8), R16 (datasheet §5 instruction map)
     # 0x60..0x67 → LD (r32+d8), R32
     # ============================================================
     if 0xB8 <= b <= 0xBF:
@@ -990,75 +1100,119 @@ def decode_zz_mem(data, pos, cur_addr, base):
             if not _safe(data, pos, n + 3): return None
             imm = u16(data, pos + n + 1)
             return (n+3, alu_imm[op], f'{mem_str}, 0x{imm:04X}{ann}', refs, warn)
-    # LD (mem), #imm16 indirect — 0x19
+    # MUL/MULS/DIV/DIVS RR, (mem) — 0x40..0x5F (dest one size wider than zz)
+    if 0x40 <= op <= 0x5F:
+        mul_ops = {0x40:'mul', 0x48:'muls', 0x50:'div', 0x58:'divs'}
+        for base, mnem in mul_ops.items():
+            if base <= op < base + 8:
+                dr = R16[op & 7] if zz == 0 else R32[op & 7]
+                return (n+1, mnem, f'{dr}, {mem_str}{ann}', refs, warn)
+    # LDI/LDIR/LDD/LDDR/CPI/CPIR/CPD/CPDR — 0x10..0x17
+    _block_ops = {0x10:'ldi', 0x11:'ldir', 0x12:'ldd', 0x13:'lddr',
+                  0x14:'cpi', 0x15:'cpir', 0x16:'cpd', 0x17:'cpdr'}
+    if op in _block_ops:
+        return (n+1, _block_ops[op], mem_str, refs, warn)
+    # LD (nn), (mem) — 0x19  (dest=nn abs16, src=mem indirect, per datasheet §5)
     if op == 0x19:
         if not _safe(data, pos, n + 3): return None
-        src = u16(data, pos + n + 1)
-        src_s, src_anm = fmt_mem(src)
-        ann2 = f'  ; {src_anm}' if src_anm else ''
-        return (n+3, 'ld', f'{mem_str}, {src_s}{ann2}', refs, warn)
+        nn = u16(data, pos + n + 1)
+        nn_s, nn_anm = fmt_mem(nn)
+        ann2 = f'  ; {nn_anm}' if nn_anm else ''
+        return (n+3, 'ld', f'{nn_s}, {mem_str}{ann2}', refs, warn)
 
     return None
 
 # ============================================================
-# _retmem_info — decode B0_mem / zz_mem address field
-# Returns (n_consumed, mem_str, addr_val_or_None) or (None, None, None)
-# n_consumed = bytes used by opcode + address (excludes trailing op byte)
+# _retmem_info — decode the addressing-mode bytes for a given mem index
+#
+# Called by decode_zz_mem and decode_B0_mem after extracting mem=_getmem(b).
+# pos points to the first byte (the prefix byte b), not the byte after it.
+#
+# Returns (n_consumed, mem_str, addr_val_or_None) or (None, None, None) on error.
+#   n_consumed : total bytes consumed INCLUDING the prefix byte b.
+#   mem_str    : human-readable address expression, e.g. "(XWA+4)" or "(0x8032)".
+#   addr_val   : numeric address if statically known (for HW annotation), else None.
+#
+# Trailing operation byte is NOT consumed here — callers read data[pos + n_consumed].
 # ============================================================
 
 def _retmem_info(data, pos, mem):
-    if 0 <= mem <= 7:                    # (r32) — ARI_XWA..ARI_XSP
+    # mem 0..7  — ARI: register-indirect (r32), no extra bytes
+    if 0 <= mem <= 7:
         return (1, f'({R32[mem]})', None)
-    elif 8 <= mem <= 15:                 # (r32+d8) — ARID_XWA..ARID_XSP
+
+    # mem 8..15 — ARID: register-indirect with signed 8-bit displacement (r32+d8)
+    elif 8 <= mem <= 15:
         if not _safe(data, pos, 2): return (None, None, None)
         d = s8(data, pos+1)
         sign = '+' if d >= 0 else ''
         return (2, f'({R32[mem-8]}{sign}{d})', None)
-    elif mem == 16:                      # ABS_B: (addr8)
+
+    # mem 16 — ABS_B: 1-byte absolute address (I/O space 0x00..0xFF)
+    elif mem == 16:
         if not _safe(data, pos, 2): return (None, None, None)
         addr = data[pos+1]
         return (2, f'(0x{addr:02X})', addr)
-    elif mem == 17:                      # ABS_W: (addr16)
+
+    # mem 17 — ABS_W: 2-byte absolute address (0x0000..0xFFFF, covers all HW registers)
+    #   Used by C1 (byte), D1 (word), E1 (lword) prefix bytes in decode_zz_mem
+    elif mem == 17:
         if not _safe(data, pos, 3): return (None, None, None)
         addr = u16(data, pos+1)
         return (3, f'(0x{addr:04X})', addr)
-    elif mem == 18:                      # ABS_L: (addr24)
+
+    # mem 18 — ABS_L: 3-byte absolute address (full 24-bit address space)
+    elif mem == 18:
         if not _safe(data, pos, 4): return (None, None, None)
         addr = u24(data, pos+1)
         return (4, f'(0x{addr:06X})', addr)
-    elif mem == 19:                      # ARI: secondary byte encodes r32+mode
+
+    # mem 19 — ARI with secondary byte: encodes (r32), (r32+d16), or (r32+reg)
+    #   Second byte layout: [r32_idx:6][mode:2]  (r32_idx = bits[7:2] >> 2)
+    #   mode 0x00 → (r32)       — same as mem 0..7 but via secondary byte
+    #   mode 0x01 → (r32+d16)   — with signed 16-bit displacement (4 bytes total)
+    #   mode 0x03 → (r32+R8)    — indexed, bit2 of secondary byte = 0
+    #   mode 0x03 → (r32+R16)   — indexed, bit2 of secondary byte = 1
+    elif mem == 19:
         if not _safe(data, pos, 2): return (None, None, None)
         b2 = data[pos+1]
-        mode = b2 & 0x03
+        mode    = b2 & 0x03
         r32_idx = (b2 & 0xFC) >> 2
         if r32_idx >= len(R32): return (None, None, None)
-        if mode == 0x00:                 # (r32)
+        if mode == 0x00:                 # (r32) — secondary-byte form
             return (2, f'({R32[r32_idx]})', None)
-        elif mode == 0x01:               # (r32+d16)
+        elif mode == 0x01:               # (r32+d16) — displacement 16
             if not _safe(data, pos, 4): return (None, None, None)
             d = s16(data, pos+2)
             sign = '+' if d >= 0 else ''
             return (4, f'({R32[r32_idx]}{sign}{d})', None)
-        elif mode == 0x03:               # (r32+r8/r16)
+        elif mode == 0x03:               # (r32+reg) — indexed by R8 or R16
             if not _safe(data, pos, 4): return (None, None, None)
             r32_i2 = (data[pos+2] & 0xFC) >> 2
             r_i2   = data[pos+3] & 0x07
             if r32_i2 >= len(R32): return (None, None, None)
             if b2 & 0x04:
-                return (4, f'({R32[r32_i2]}+{R16[r_i2]})', None)
+                return (4, f'({R32[r32_i2]}+{R16[r_i2]})', None)  # indexed by R16
             else:
-                return (4, f'({R32[r32_i2]}+{R8[r_i2]})', None)
+                return (4, f'({R32[r32_i2]}+{R8[r_i2]})', None)   # indexed by R8
         return (None, None, None)
-    elif mem == 20:                      # ARI_PD: (-r32)
+
+    # mem 20 — ARI_PD: pre-decrement (-r32), r32 specified in secondary byte
+    elif mem == 20:
         if not _safe(data, pos, 2): return (None, None, None)
         r32_idx = (data[pos+1] & 0xFC) >> 2
         if r32_idx >= len(R32): return (None, None, None)
         return (2, f'(-{R32[r32_idx]})', None)
-    elif mem == 21:                      # ARI_PI: (r32+)
+
+    # mem 21 — ARI_PI: post-increment (r32+), r32 specified in secondary byte
+    elif mem == 21:
         if not _safe(data, pos, 2): return (None, None, None)
         r32_idx = (data[pos+1] & 0xFC) >> 2
         if r32_idx >= len(R32): return (None, None, None)
         return (2, f'({R32[r32_idx]}+)', None)
+
+    # mem >= 23 — register-source forms (C8+zz+r prefix) — should be routed to decode_zz_r
+    # This path means a caller passed an unexpected mem value.
     return (None, None, None)
 
 # ============================================================
@@ -1085,7 +1239,7 @@ def decode_B0_mem(data, pos, cur_addr, base):
         target = (cur_addr + 4 + d) & 0xFFFFFF
         op = data[pos+4]
         r_idx = op & 0x07
-        if op & 0x20:
+        if op & 0x10:  # s-bit: 0=word(R16), 1=long(R32) — datasheet §5 LDAR encoding
             return (5, 'ldar', f'{R32[r_idx]}, 0x{target:06X}', refs, warn)
         return (5, 'ldar', f'{R16[r_idx]}, 0x{target:06X}', refs, warn)
 
@@ -1199,45 +1353,59 @@ def decode_B0_mem(data, pos, cur_addr, base):
 # ============================================================
 
 def decode_one(data, pos, cur_addr, base):
-    """
-    Decode one instruction.
-    Returns (length, mnem, ops, refs, warn) or None on failure.
-    refs = [(addr, 'call'|'jump'|'data'), ...]
+    """Decode one instruction at data[pos] (cur_addr = ROM address of this byte).
+
+    Returns (length, mnem, ops, refs, warn) or None on complete failure.
+      length : byte count of this instruction (always >= 1)
+      mnem   : mnemonic string (lowercase, e.g. 'ld', 'call', 'ldc')
+      ops    : operands string (empty string if none)
+      refs   : list of (target_addr, 'call'|'jump'|'data') for Pass 1 label collection
+      warn   : warning string if broken opcode detected, else None
+
+    Dispatch order (first match wins):
+      1. decode_fixed   — exact single-byte opcodes and short patterns (NOP, RET, EI, SWI…)
+      2. decode_xx      — 0x20..0x7F range: LD imm8/16/32, PUSH/POP, JR/JRL
+      3. >= 0x80 with zz==3 → decode_B0_mem (stores, RET cc, indirect JP/CALL, LDAR)
+      4. >= 0x80 with mem>=23 → decode_zz_r (register ALU, LINK, UNLK, LDC, shifts)
+      5. >= 0x80 with mem<=21 → decode_zz_mem (indirect/abs loads/stores, LDIW, LDIRW)
+      6. Fallback: emit raw 'db 0xXX' with '?? unknown opcode' warning
     """
     if pos >= len(data):
         return None
 
     b = data[pos]
 
-    # 1. Try fixed opcodes first
+    # 1. Try fixed opcodes first (catches NOP, RET, RETI, EI, DI, JP/CALL abs, SWI…)
     r = decode_fixed(data, pos, cur_addr, base)
     if r: return r
 
-    # 2. < 0x80 → decode_xx (LD imm, PUSH, POP, JR, JRL)
+    # 2. 0x20..0x7F — LD imm, PUSH/POP R16/R32, JR/JRL, LD R32 imm32
     if b < 0x80:
         r = decode_xx(data, pos, cur_addr, base)
         if r: return r
 
-    # 3. >= 0x80 → check zz and mem fields
+    # 3..5. 0x80..0xFF — decode based on zz (bits[5:4]) and mem (_getmem)
     if b >= 0x80:
         zz  = (b & 0x30) >> 4
         mem = _getmem(b)
 
         if zz == 3:
-            # B0_mem group (abs16 stores, RET cc, indirect JP/CALL)
+            # B0_mem group: absolute stores (LD (abs),R), RET cc, indirect JP/CALL, LDAR
             r = decode_B0_mem(data, pos, cur_addr, base)
             if r: return r
         else:
             if mem >= 23:
-                # C8+zz+r ALU / E8+r special
+                # C8+zz+r: ALU on register, LINK/UNLK, LDC, shifts, bit ops
+                # Also handles broken D0..D7 (warn emitted via _zz_regs)
                 r = decode_zz_r(data, pos, cur_addr, base)
                 if r: return r
             elif mem <= 21:
-                # Indirect loads/stores
+                # Indirect addressing: (r32), (r32+d8), (abs8/16/24), post-inc/pre-dec
+                # Also handles D0..D7 broken ALU prefix with inline warning
                 r = decode_zz_mem(data, pos, cur_addr, base)
                 if r: return r
 
-    # Fallback: emit raw byte
+    # Fallback: unrecognized byte → emit raw db directive
     return (1, 'db', f'0x{b:02X}', [], '?? unknown opcode')
 
 # ============================================================
@@ -1255,7 +1423,7 @@ def parse_header(data):
     licensed = (copyright_s[0:1] == b' ')
     entry    = u32(data, 0x1C) if len(data) >= 0x20 else ROM_BASE + HEADER_SIZE
     sw_id    = u16(data, 0x20) if len(data) >= 0x22 else 0
-    color    = (data[0x23] == 0x10) if len(data) >= 0x24 else False
+    color    = (data[0x22] == 0x10) if len(data) >= 0x23 else False
     title    = data[0x24:0x30].rstrip(b' \x00').decode('ascii', errors='replace')
     return {
         'licensed': licensed,
@@ -1308,15 +1476,22 @@ class LabelMap:
 # ============================================================
 
 def detect_pattern(data, pos):
-    """Return pattern string if a known pattern is detected at pos."""
+    """Return a comment string if a known structural pattern is detected at pos.
+
+    Detected patterns:
+      ED 0C d16  → LINK XIY, N  — t900cc.py/CC900 function prologue
+                   annotated !BROKEN if N >= 5 (NGPC silicon bug)
+      ED 0D      → UNLK XIY     — function epilogue
+    Returns None if no pattern matched.
+    """
     if pos + 4 <= len(data):
-        # LINK XIY, N — function prologue
+        # LINK XIY, N (ED = E8+5 = XIY prefix, 0C = LINK sub-op, d16 = displacement)
         if data[pos] == 0xED and data[pos+1] == 0x0C:
             n = s16(data, pos+2)
             if n >= 0:
                 broken = ' !BROKEN' if n >= 5 else ''
                 return f'; --- function prologue (link XIY, {n}){broken} ---'
-        # UNLK XIY — function epilogue
+        # UNLK XIY (ED = XIY prefix, 0D = UNLK sub-op)
         if data[pos] == 0xED and data[pos+1] == 0x0D:
             return '; --- function epilogue (unlk XIY) ---'
     return None
@@ -1326,12 +1501,28 @@ def detect_pattern(data, pos):
 # ============================================================
 
 def disassemble(data, base, start=None, end=None, init_labels=None):
-    """
-    Two-pass linear sweep.
-    Pass 1: collect all jump/call targets.
-    Pass 2: emit annotated asm.
-    Returns list of output lines.
-    init_labels: pre-populated LabelMap (e.g. entry_point from header)
+    """Two-pass linear sweep disassembler.
+
+    Args:
+      data        : raw ROM bytes (no header offset adjustment needed)
+      base        : ROM base address (default 0x200000 for NGPC cartridges)
+      start/end   : address range to disassemble (default = entire ROM)
+      init_labels : pre-populated LabelMap (e.g. with entry_point from header)
+
+    Pass 1 — label collection:
+      Decode each instruction and record CALL/JP target addresses in LabelMap.
+      Unknown bytes advance by 1 byte. Labels are finalized (sub_XXXXXX / loc_XXXXXX)
+      after the full pass.
+
+    Pass 2 — emit:
+      Re-decode every instruction. For each:
+        • emit label line if this address is a known target
+        • emit detect_pattern() comment for prologue/epilogue markers
+        • emit: ADDR: hex_bytes    mnem operands    ; comment
+          comment = silicon warning (if broken opcode) OR cross-ref label (if CALL/JP)
+          OR HW register annotation embedded in operand string
+
+    Returns list of strings (one line per instruction + label lines).
     """
     if start is None: start = base
     if end   is None: end   = base + len(data)
