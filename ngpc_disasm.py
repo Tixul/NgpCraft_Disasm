@@ -1168,17 +1168,19 @@ def _retmem_info(data, pos, mem):
         return (4, f'(0x{addr:06X})', addr)
 
     # mem 19 — ARI with secondary byte: encodes (r32), (r32+d16), or (r32+reg)
-    #   Second byte layout: [r32_idx:6][mode:2]  (r32_idx = bits[7:2] >> 2)
+    #   Second byte layout: [r32_upper6:6][mode:2]
+    #   r32 index = (byte >> 2) & 0x07  — upper-6-bits of full current-bank code, masked to 0..7
     #   mode 0x00 → (r32)       — same as mem 0..7 but via secondary byte
     #   mode 0x01 → (r32+d16)   — with signed 16-bit displacement (4 bytes total)
     #   mode 0x03 → (r32+R8)    — indexed, bit2 of secondary byte = 0
     #   mode 0x03 → (r32+R16)   — indexed, bit2 of secondary byte = 1
+    #   For indexed (mode=3): third byte = r32 base code, fourth byte = r8/r16 code
+    #   All register codes use formula (byte >> 2) & 0x07 (current-bank full code → index 0..7)
     elif mem == 19:
         if not _safe(data, pos, 2): return (None, None, None)
         b2 = data[pos+1]
         mode    = b2 & 0x03
-        r32_idx = (b2 & 0xFC) >> 2
-        if r32_idx >= len(R32): return (None, None, None)
+        r32_idx = (b2 >> 2) & 0x07
         if mode == 0x00:                 # (r32) — secondary-byte form
             return (2, f'({R32[r32_idx]})', None)
         elif mode == 0x01:               # (r32+d16) — displacement 16
@@ -1188,25 +1190,26 @@ def _retmem_info(data, pos, mem):
             return (4, f'({R32[r32_idx]}{sign}{d})', None)
         elif mode == 0x03:               # (r32+reg) — indexed by R8 or R16
             if not _safe(data, pos, 4): return (None, None, None)
-            r32_i2 = (data[pos+2] & 0xFC) >> 2
-            r_i2   = data[pos+3] & 0x07
-            if r32_i2 >= len(R32): return (None, None, None)
+            r32_i2 = (data[pos+2] >> 2) & 0x07
+            r_i2   = (data[pos+3] >> 2) & 0x07
             if b2 & 0x04:
                 return (4, f'({R32[r32_i2]}+{R16[r_i2]})', None)  # indexed by R16
             else:
                 return (4, f'({R32[r32_i2]}+{R8[r_i2]})', None)   # indexed by R8
         return (None, None, None)
 
-    # mem 20 — ARI_PD: pre-decrement (-r32), r32 in bits[2:0] of secondary byte
+    # mem 20 — ARI_PD: pre-decrement (-r32)
+    #   r32 index = (secondary >> 2) & 0x07  (upper-6-bits of full current-bank code)
     elif mem == 20:
         if not _safe(data, pos, 2): return (None, None, None)
-        r32_idx = data[pos+1] & 0x07
+        r32_idx = (data[pos+1] >> 2) & 0x07
         return (2, f'(-{R32[r32_idx]})', None)
 
-    # mem 21 — ARI_PI: post-increment (r32+), r32 in bits[2:0] of secondary byte
+    # mem 21 — ARI_PI: post-increment (r32+)
+    #   r32 index = (secondary >> 2) & 0x07  (upper-6-bits of full current-bank code)
     elif mem == 21:
         if not _safe(data, pos, 2): return (None, None, None)
-        r32_idx = data[pos+1] & 0x07
+        r32_idx = (data[pos+1] >> 2) & 0x07
         return (2, f'({R32[r32_idx]}+)', None)
 
     # mem >= 23 — register-source forms (C8+zz+r prefix) — should be routed to decode_zz_r
