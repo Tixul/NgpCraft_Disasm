@@ -16,7 +16,7 @@ Implements the full TLCS-900/L1 instruction set from the official Toshiba TMP95C
 - **NGPC hardware register annotations** — joypad, VBlank vector, watchdog, K2GE, sprite VRAM, scroll planes, tile RAM
 - **BIOS SWI names** — `swi 1` → `BIOS_CLOCKGEARSET`, `swi 5` → `BIOS_SYSFONTSET`, etc.
 - **DMA LDC register names** — `DMAC0`, `DMAS0`, `DMAD0`, `DMAM1`…
-- **Broken opcode detection** — `D0` prefix, `CB` family, `LINK XIY, N≥5`, `ADC W, B` with W>0 all flagged `; !BROKEN`
+- **Broken opcode detection** — `D0` prefix, `CB` family (`add A, C` and friends), `LINK XIY, N≥5`, and `adc W, B` (silent wrong result when W>0) all flagged `; !BROKEN <reason — fix>` inline. The CB and `adc W, B` flags were wired up in 2026-04 to match the README's claims.
 - **Two-pass label resolution** — `entry_point:`, `sub_2XXXXX:` (call targets), `loc_2XXXXX:` (jump targets) with `; -> sub_XXXXXX` cross-references on every call/jump
 - **Auto ROM header parsing** — detects title, entry point, color/mono, software ID from the 64-byte SNK header
 
@@ -98,7 +98,10 @@ Unknown bytes in code regions are always data sections (tiles, strings, jump tab
 | `--end ADDR` | Last address to disassemble (default: end of file) |
 | `-o FILE` | Write to file instead of stdout |
 
-All addresses accept hex (`0x200040`) or decimal.
+All addresses accept hex with or without the `0x` prefix (`0x200040` or
+`200040`). Bad input is rejected up-front with a clear stderr message and
+a non-zero exit code: missing ROM (`1`), permission denied (`1`), bad hex
+(`2`), `--start` greater than `--end` (`2`). Successful runs exit `0`.
 
 ---
 

@@ -45,7 +45,17 @@ python ngpc_disasm.py code.bin --base 0x200040
 | `--end ADDR` | Last address to disassemble (default: end of file) |
 | `-o FILE` | Write output to FILE instead of stdout |
 
-All addresses accept hex (`0x200040`) or decimal notation.
+All addresses accept hex with or without the `0x` prefix (`0x200040` or
+`200040`).
+
+### Exit codes
+
+- `0` — success
+- `1` — ROM file missing, unreadable, or output file cannot be written
+- `2` — bad CLI arg (non-hex address, `--start` greater than `--end`)
+
+Errors print a single-line stderr message rather than a Python traceback,
+so the tool can be wrapped cleanly in shell scripts and CI pipelines.
 
 ---
 
@@ -172,15 +182,17 @@ Instructions that are **known to crash or hang on NGPC silicon** are annotated w
 
 ### Known broken opcodes on NGPC silicon
 
-| Opcode(s) | Issue |
-|-----------|-------|
-| `D0 xx` | D0 prefix (all sub-ops) — hangs watchdog |
-| `D1..D7 xx` (ALU sub-ops) | Word-register ALU — broken (but D1/D2-D5 as abs-address loads are **safe**) |
-| `CB xx` | Entire CB opcode family — causes infinite loop |
-| `LINK XIY, N` where N≥5 | Stack frame too large — corrupts SP |
-| `ADC W, B` when W > 0 | ADC high byte produces wrong result |
+| Opcode(s) | Issue | Suggested fix |
+|-----------|-------|---------------|
+| `D0 xx` | D0 prefix (all sub-ops) — hangs watchdog | Use D8 (R32) family, e.g. `extz xwa; sll N, xwa` instead of `sll N, wa` |
+| `D1..D7 xx` (ALU sub-ops) | Word-register ALU — broken (but D1/D2-D5 as abs-address loads are **safe**) | Switch to byte (C8..CF) or lword (D8..DF / E8..EF) source |
+| `CB xx` | Byte ALU using R8[3]=C as source. `add A, C` (CB 81) hangs | Route through HL: `add A, L` (CF 81). Other byte-ALU prefixes (C8 W, C9 A, CA B, CC D, CD E, CE H, CF L) are confirmed safe |
+| `LINK XIY, N` where N≥5 | Stack frame too large — corrupts SP | Use `link XIY, 0` then `add XSP, -N` to allocate locals |
+| `adc W, B` when W > 0 | High-byte add produces wrong result silently | Keep W=0 (count ≤ 255) or split the add manually |
 
-> **Note:** `D1` as abs16 load (`LD R16, (abs16)`) and `D2–D5` used as abs-address memory loads (`LD R16, (abs24)`, `LD R16, (r32)`, etc.) are **safe** and decode normally without a warning.
+> **Note:** `D1` as abs16 load (`LD R16, (abs16)`) and `D2–D5` used as abs-address memory loads (`LD R16, (abs24)`, `LD R16, (r32)`, etc.) are **safe** and decode normally without a warning. The CB warning fires only on prefix `0xCB` specifically; the surrounding C8..CF family (W/A/B/D/E/H/L sources) is confirmed safe by CC900 production code.
+
+> **About the `adc W, B` warning:** static disassembly cannot know the runtime value of `W`. The flag is unconditional — the reader is expected to verify intent. A safe `adc W, B` with `W==0` will still be flagged.
 
 ---
 

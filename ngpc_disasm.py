@@ -512,17 +512,25 @@ def _zz_regs(b):
     """Returns (size_str, reg_name, is_broken) for C8+zz+r / E8+r prefix byte.
 
     In ALU-register context:
-      C8..CF → ('b', R8[r],  False)  byte  register, safe
-      D0..D7 → ('w', R16[r], True)   word  register, BROKEN on NGPC silicon
-      D8..DF → ('l', R32[r], False)  lword register, safe (R32, not R16!)
-      E8..EF → ('l', R32[r], False)  lword register, safe
-      C7     → ('b', None,   False)  extended bank-reg prefix, r=None sentinel
+      C8..CF → ('b', R8[r],  False/True)  byte register; CB specifically broken
+      D0..D7 → ('w', R16[r], True)        word register, BROKEN on NGPC silicon
+      D8..DF → ('l', R32[r], False)       lword register, safe (R32, not R16!)
+      E8..EF → ('l', R32[r], False)       lword register, safe
+      C7     → ('b', None,   False)       extended bank-reg prefix, r=None sentinel
+
+    Confirmed broken instructions on NGPC silicon (validated bisect 2026-03-22):
+      CB xx → byte ALU using R8[3] = C as source. Example: `add A, C` = CB 81
+              hangs in an infinite loop. Fix: route through HL — `add A, L` = CF 81.
+      D0..D7 xx → word ALU using R16 as source. Example: `cpl WA` = D0 06 hangs.
+                  Fix: extz XWA + use D8 (lword source) family.
 
     See module docstring for the LDC context asymmetry (D8 = R16 for LDC encoding
     but this function returns R32 — both naming conventions refer to the same bits).
     """
     if 0xC8 <= b <= 0xCF:
-        return ('b', R8[b & 7], False)
+        # CB specifically broken on silicon (CB family — byte ALU with C source).
+        # The other C8..CF variants are confirmed safe in CC900 production code.
+        return ('b', R8[b & 7], b == 0xCB)
     if 0xD0 <= b <= 0xD7:
         return ('w', R16[b & 7], True)   # BROKEN on NGPC silicon (D0..D7 ALU prefix)
     if 0xD8 <= b <= 0xDF:
@@ -544,7 +552,13 @@ def decode_zz_r(data, pos, cur_addr, base):
     sz, reg, broken = _zz_regs(b)
 
     refs = []
-    warn = '!BROKEN D0..D7 ALU (word-reg prefix)' if broken else None
+    if broken:
+        if b == 0xCB:
+            warn = '!BROKEN CB family (byte ALU C-source) — silicon hang, use CF (L-source) instead'
+        else:
+            warn = '!BROKEN D0..D7 ALU (word-reg prefix)'
+    else:
+        warn = None
     is_e8 = (0xE8 <= b <= 0xEF)
 
     # ---- Extended register prefix (0xC7) — next byte is bank reg index ----
@@ -709,6 +723,12 @@ def decode_zz_r(data, pos, cur_addr, base):
     for base_op, mnem in alu_r_ops.items():
         if base_op <= c < base_op + 8:
             R_idx = c & 0x07
+            # `adc W, B` (CA 90) fails on NGPC silicon when W > 0 — see
+            # bugs_silicon.json ADC_W_B_W_GT_0. Static disasm can't know W's
+            # runtime value, so flag the instruction for review.
+            if (mnem == 'adc' and sz == 'b'
+                    and reg == 'B' and dest_reg(R_idx) == 'W'):
+                warn = '!BROKEN adc W,B fails when W>0 (silicon) — keep W==0 or restructure'
             if base_op == 0x98:
                 # LD r, R  (reverse direction)
                 return (2, 'ld', f'{reg}, {dest_reg(R_idx)}', refs, warn)
@@ -1604,18 +1624,37 @@ def disassemble(data, base, start=None, end=None, init_labels=None):
 # Main
 # ============================================================
 
+def _parse_hex(text, name):
+    """Parse a CLI hex argument with friendly error reporting."""
+    try:
+        return int(text, 16)
+    except (TypeError, ValueError):
+        sys.stderr.write(
+            f"[ngpc_disasm] error: --{name} expects a hex value, got: {text!r}\n")
+        sys.exit(2)
+
 def main():
     parser = argparse.ArgumentParser(
         description='NgpCraft NGPC/NGP Disassembler — TLCS-900 with NGPC annotations')
     parser.add_argument('rom', help='ROM file (.ngc / .ngp / .bin)')
-    parser.add_argument('--base',  default=None, help='Override ROM base address (hex)')
-    parser.add_argument('--start', default=None, help='Start disassembly address (hex)')
-    parser.add_argument('--end',   default=None, help='End disassembly address (hex)')
+    parser.add_argument('--base',  default=None, help='Override ROM base address (hex, with or without 0x prefix)')
+    parser.add_argument('--start', default=None, help='Start disassembly address (hex, with or without 0x prefix)')
+    parser.add_argument('--end',   default=None, help='End disassembly address (hex, with or without 0x prefix)')
     parser.add_argument('-o', '--output', default=None, help='Output file (default: stdout)')
     args = parser.parse_args()
 
-    with open(args.rom, 'rb') as f:
-        data = f.read()
+    try:
+        with open(args.rom, 'rb') as f:
+            data = f.read()
+    except FileNotFoundError:
+        sys.stderr.write(f"[ngpc_disasm] error: ROM file not found: {args.rom}\n")
+        sys.exit(1)
+    except PermissionError:
+        sys.stderr.write(f"[ngpc_disasm] error: cannot read {args.rom} (permission denied)\n")
+        sys.exit(1)
+    except OSError as e:
+        sys.stderr.write(f"[ngpc_disasm] error: cannot open {args.rom}: {e}\n")
+        sys.exit(1)
 
     # Parse ROM header
     hdr = parse_header(data)
@@ -1633,15 +1672,22 @@ def main():
         lic   = '?'
 
     if args.base:
-        base = int(args.base, 16)
+        base = _parse_hex(args.base, 'base')
     # Default start: skip header when ROM is detected (entry point or base+HEADER_SIZE)
     if args.start:
-        start = int(args.start, 16)
+        start = _parse_hex(args.start, 'start')
     elif hdr:
         start = base + HEADER_SIZE  # skip header bytes — shown separately in banner
     else:
         start = base
-    end = int(args.end, 16) if args.end else base + len(data)
+    end = _parse_hex(args.end, 'end') if args.end else base + len(data)
+
+    # Reject reversed range up front — silent empty output is worse than a clear error.
+    if start > end:
+        sys.stderr.write(
+            f"[ngpc_disasm] error: --start (0x{start:X}) is greater than "
+            f"--end (0x{end:X}) — nothing to disassemble.\n")
+        sys.exit(2)
 
     labels = LabelMap()
     if hdr:
@@ -1680,11 +1726,16 @@ def main():
     out_text = '\n'.join(out_lines) + '\n'
 
     if args.output:
-        with open(args.output, 'w', encoding='utf-8') as f:
-            f.write(out_text)
+        try:
+            with open(args.output, 'w', encoding='utf-8') as f:
+                f.write(out_text)
+        except OSError as e:
+            sys.stderr.write(f"[ngpc_disasm] error: cannot write {args.output}: {e}\n")
+            sys.exit(1)
         print(f'[ngpc_disasm] Written {len(out_lines)} lines to {args.output}')
     else:
         sys.stdout.write(out_text)
+    sys.exit(0)
 
 
 if __name__ == '__main__':
