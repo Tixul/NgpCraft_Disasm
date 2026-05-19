@@ -185,12 +185,16 @@ Instructions that are **known to crash or hang on NGPC silicon** are annotated w
 | Opcode(s) | Issue | Suggested fix |
 |-----------|-------|---------------|
 | `D0 xx` | D0 prefix (all sub-ops) — hangs watchdog | Use D8 (R32) family, e.g. `extz xwa; sll N, xwa` instead of `sll N, wa` |
+| `D0 C8..CF lo hi` (ALU-imm `<alu> WA, imm16`) | **HW crash confirmed 2026-05-20** on `stargunner_j16_C4_phase4_BROKEN_HW_20260520.ngc`. The earlier "safe-second-range 0xC8..0xCF" classification was wrong; CC900 emits 0 instances of this family in `f_code`. | Byte-split: `ld HL, imm; <alu> A, L; <carry> W, H` (the CC900 pattern, used for 25+ years) |
 | `D1..D7 xx` (ALU sub-ops) | Word-register ALU — broken (but D1/D2-D5 as abs-address loads are **safe**) | Switch to byte (C8..CF) or lword (D8..DF / E8..EF) source |
+| `D8..DF` ALU r+r (sub-ops `0x80..0xEF`, except `cp r,r` `0xF0..0xF7`) | Working-bank long-register ALU register-to-register **broken on silicon**. First payoff of the toolchain↔emulator loop: `D8 8B` (= `ld XHL, XWA`) was emitted 114× in StarGunner before the toolchain shipped `_emit_copy_xwa_to_xhl` (2026-05-20) | Byte-split via stack: `push WA; pop HL; add A,L; adc W,H` for `ld XHL, XWA`-style copies. The `cp r,r` exception (`0xF0..0xF7`) remains safe. |
 | `CB xx` | Byte ALU using R8[3]=C as source. `add A, C` (CB 81) hangs | Route through HL: `add A, L` (CF 81). Other byte-ALU prefixes (C8 W, C9 A, CA B, CC D, CD E, CE H, CF L) are confirmed safe |
 | `LINK XIY, N` where N≥5 | Stack frame too large — corrupts SP | Use `link XIY, 0` then `add XSP, -N` to allocate locals |
 | `adc W, B` when W > 0 | High-byte add produces wrong result silently | Keep W=0 (count ≤ 255) or split the add manually |
 
 > **Note:** `D1` as abs16 load (`LD R16, (abs16)`) and `D2–D5` used as abs-address memory loads (`LD R16, (abs24)`, `LD R16, (r32)`, etc.) are **safe** and decode normally without a warning. The CB warning fires only on prefix `0xCB` specifically; the surrounding C8..CF family (W/A/B/D/E/H/L sources) is confirmed safe by CC900 production code.
+
+> **Synchronisation:** the broken-set above mirrors the NgpCraft toolchain's hardware-validation history (`stargunner_j16_C4_phase4*` test ROMs) and the NgpCraft_emulator `core/quirks_db.json` `2026-05-20.v4` entries `cpu.d0_d7_non_immediate`, `cpu.d8_df_register_to_register`, `cpu.link_xiy_large_frame`. When the toolchain or emulator quirk database bumps, this table is the resync target.
 
 > **About the `adc W, B` warning:** static disassembly cannot know the runtime value of `W`. The flag is unconditional — the reader is expected to verify intent. A safe `adc W, B` with `W==0` will still be flagged.
 

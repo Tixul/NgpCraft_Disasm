@@ -729,6 +729,20 @@ def decode_zz_r(data, pos, cur_addr, base):
             if (mnem == 'adc' and sz == 'b'
                     and reg == 'B' and dest_reg(R_idx) == 'W'):
                 warn = '!BROKEN adc W,B fails when W>0 (silicon) — keep W==0 or restructure'
+            # D8..DF prefix + ALU r+r sub-op is silicon-broken on real NGPC
+            # except for the `cp r, r` exception (sub-op 0xF0..0xF7). Working-
+            # bank long-register ALU register-to-register family. HW evidence:
+            # `D8 8B` (= `ld XHL, XWA`) was emitted 114× in StarGunner before
+            # the toolchain shipped `_emit_copy_xwa_to_xhl` (byte-split
+            # `push WA; pop HL; add A,L; adc W,H`) on 2026-05-20 — first
+            # NgpCraft toolchain↔emulator payoff. Mirrors NgpCraft_emulator
+            # quirks_db.json `cpu.d8_df_register_to_register` v2026-05-20.v4.
+            elif 0xD8 <= b <= 0xDF and base_op != 0xF0:
+                warn = (
+                    f'!BROKEN D{b - 0xD0:X} {c:02X} = working-bank long-register '
+                    f'{mnem or "ld(reverse)"} r+r — use byte-split (push WA / pop HL / '
+                    f'add A,L / adc W,H) or the CP exception instead'
+                )
             if base_op == 0x98:
                 # LD r, R  (reverse direction)
                 return (2, 'ld', f'{reg}, {dest_reg(R_idx)}', refs, warn)
@@ -893,11 +907,21 @@ def decode_zz_mem(data, pos, cur_addr, base):
         if 0x68 <= c <= 0x6F:
             n = c & 7
             return (2, 'dec', f'{n or 8}, {reg}', refs, warn)
-        # ALU r, imm
+        # ALU r, imm — confirmed HW crash 2026-05-20 on
+        # `stargunner_j16_C4_phase4_BROKEN_HW_20260520.ngc`. CC900 emits
+        # 0 instances of `<alu> WA, imm` in f_code; the official toolchain
+        # avoids this entire encoding. Mirrors NgpCraft_emulator quirks_db
+        # `cpu.d0_d7_non_immediate` v2026-05-20.v4 which removed the previous
+        # safe_second_ranges entry covering 0xC8..0xCF.
         alu_w = {0xC8:'add', 0xC9:'adc', 0xCA:'sub', 0xCB:'sbc',
                  0xCC:'and', 0xCD:'xor', 0xCE:'or', 0xCF:'cp'}
         if c in alu_w and _safe(data, pos, 4):
             imm = u16(data, pos+2)
+            warn = (
+                f'!BROKEN D{b-0xD0:X} {c:02X} = {alu_w[c]} {reg},imm — '
+                f'silicon-broken (HW crash 2026-05-20, CC900 emits 0 instances) — '
+                f'use byte-split: `ld HL, imm; {alu_w[c]} A, L; <carry> W, H`'
+            )
             return (4, alu_w[c], f'{reg}, 0x{imm:04X}', refs, warn)
         # ALU R, r
         for base_op, mnem in [(0x80,'add'),(0x88,'ld'),(0x90,'adc'),
