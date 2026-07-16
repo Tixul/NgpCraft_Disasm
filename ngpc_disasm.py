@@ -43,19 +43,23 @@ Decode dispatch (decode_one):
   4. decode_zz_r    — mem>=23 (C8+zz+r family): ALU on registers, LINK, UNLK, LDC, shifts
   5. decode_zz_mem  — mem<=21: indirect/abs loads and stores, LDIW, LDIRW
 
-NGPC silicon bugs annotated inline:
-  D0..D7 as ALU word-register prefix   → broken (all uses)
+NGPC silicon bugs / mis-decodes annotated inline:
+  D0..D7 = WORD MEMORY-addressing family (code re-decode in progress) — the
+           word register-direct prefix is D8..DF, NOT D0..D7. The old
+           "D0..D7 = word-register prefix / silicon-broken" framing was a
+           mis-decode (HW-confirmed 2026-07-03), not a silicon defect.
   LINK XIY, N with N >= 5              → broken
   See also: T900_DENSE_REF.md §41, silicon_bugs.md
 
 LDC encoding (TLCS-900/L1 catalog ALT00146, pattern 1 1 z z 1 r r r):
   C8+r  zz=00 → byte  register (R8,  ldcb)   0xC8+r
-  D8+r  zz=01 → word  register (R16, ldcw)   0xD8+r   ← D0+r (zz=00,bit3=0) is broken!
+  D8+r  zz=01 → word  register (R16, ldcw)   0xD8+r   ← the word register-direct prefix
+                (D0+r is NOT a word-register prefix — D0..D7 is a WORD MEMORY family)
   E8+r  zz=10 → lword register (R32, ldcl)   0xE8+r
-  NOTE: in the ALU-register-source context (C8/D8/E8 prefix before ALU sub-byte),
-  D8..DF selects R32 operand (not R16). Only the LDC sub-byte (0x2E/0x2F) uses
-  D8 to mean R16. The disassembler shows register by _zz_regs() (ALU convention),
-  so LDC D8 2E cr appears as "ldc CR, XWA" — functionally correct (WA ⊂ XWA).
+  NOTE: HW-confirmed 2026-07-03 — D8..DF is a 16-bit WORD prefix (R16) in BOTH the
+  LDC sub-byte context AND the ALU-register-source context. There is no size
+  asymmetry: D8+r = R16 (WA…SP) everywhere, E8+r = R32 (XWA…XSP) everywhere. So
+  LDC D8 2E cr decodes as "ldc CR, WA" (word), matching CC900 ldcw DMAC0, WA.
 
 Sources: t900as.py (encoder), TMP95C061BFG datasheet (Toshiba, ALT00146),
          HW_REGISTERS.md, BIOS_REF.md, ngpc_romtool.py, silicon notes.
@@ -214,10 +218,14 @@ def _safe(data, i, n=1):
 # ============================================================
 
 def _is_broken_d0_family(b, context='alu'):
-    """D0-D7 as ALU word-register source prefix = BROKEN on NGPC silicon.
-    NOTE: this helper is NOT called from the main decode path; the broken flag
-    is set inline in _zz_regs() and decode_zz_mem(). Kept as explicit predicate
-    for external callers that may need to query broken-ness without decoding."""
+    """D0..D7 predicate — LEGACY / MIS-DIAGNOSIS.
+    HW-confirmed 2026-07-03: D0..D7 is NOT a word-register ALU prefix at all; it
+    is a WORD MEMORY-addressing family (e.g. `D0 B6 3F 50 00` = `cpw (0xB6),0x0050`).
+    The word register-direct prefix is D8..DF. The old "D0..D7 = broken word-reg
+    ALU" belief was a mis-decode (the 2026-05-20 `D0 C8` crash = toolchain emitted
+    D0 intending a word-reg-immediate, but D0 is a memory mode), not a silicon bug.
+    This helper is NOT called from the main decode path; kept for backward compat.
+    The proper D0..D7 memory re-decode in the code is an in-progress chantier."""
     return 0xD0 <= b <= 0xD7 and context == 'alu'
 
 def check_broken_link(n):
@@ -493,53 +501,90 @@ def decode_xx(data, pos, cur_addr, base):
 #
 # Prefix byte layout in ALU-register context:
 #   C8..CF  (1100 1rrr) : byte  operand — R8  source  → sz='b', safe
-#   D0..D7  (1101 0rrr) : word  operand — R16 source  → sz='w', BROKEN on NGPC silicon
-#   D8..DF  (1101 1rrr) : lword operand — R32 source  → sz='l', safe
-#   E8..EF  (1110 1rrr) : lword (alt)   — R32 source  → sz='l', safe (extz, LDIRW…)
+#   D0..D7  (1101 0rrr) : NOT a register prefix — WORD MEMORY-addressing family
+#                         (HW-confirmed 2026-07-03; code re-decode in progress).
+#                         Routed to decode_zz_mem, not here. The current _zz_regs
+#                         entry below still mis-decodes it as a word-reg prefix.
+#   D8..DF  (1101 1rrr) : word  operand — R16 source  → sz='w', safe (HW 2026-07-03)
+#                         — THIS is the word register-direct prefix, not D0..D7.
+#   E8..EF  (1110 1rrr) : lword operand — R32 source  → sz='l', safe (extz, LDIRW…)
 #   C7      (1100 0111) : extended bank register prefix (bank_idx byte follows)
 #
 # LDC sub-encoding note (when second byte is 0x2E/0x2F):
 #   In the LDC instruction encoding (catalog ALT00146 §4, pattern 1 1 z z 1 r r r),
-#   D8+r means R16 (word) and E8+r means R32 (long word). This differs from the ALU
-#   register context where D8+r selects R32. The disassembler uses _zz_regs() for both
-#   and will therefore show "ldc CR, XWA" for a D8 2E cr sequence (CC900 ldcw DMAC0,WA).
-#   Functionally equivalent: WA is the low word of XWA. For correctness, use E8 (ldcl
-#   with R32=XWA) for 32-bit registers (DMAS/DMAD), and D8 (ldcw with WA displayed as
-#   XWA by this disassembler) is safe for 16-bit registers (DMAC/DMAM).
+#   D8+r means R16 (word) and E8+r means R32 (long word). HW-confirmed 2026-07-03:
+#   this matches the ALU register context exactly — D8+r selects R16 there too. The
+#   disassembler uses _zz_regs() for both and shows "ldc CR, WA" for a D8 2E cr
+#   sequence (CC900 ldcw DMAC0, WA). Use E8 (ldcl with R32=XWA) for 32-bit registers
+#   (DMAS/DMAD); D8 (ldcw with WA) is correct for 16-bit registers (DMAC/DMAM).
 # ============================================================
 
 def _zz_regs(b):
     """Returns (size_str, reg_name, is_broken) for C8+zz+r / E8+r prefix byte.
 
     In ALU-register context:
-      C8..CF → ('b', R8[r],  False/True)  byte register; CB specifically broken
-      D0..D7 → ('w', R16[r], True)        word register, BROKEN on NGPC silicon
-      D8..DF → ('l', R32[r], False)       lword register, safe (R32, not R16!)
-      E8..EF → ('l', R32[r], False)       lword register, safe
+      C8..CF → ('b', R8[r],  False/True)  byte register; CB has a broken variant
+                                          (the True is a prefix-level "has a broken
+                                          sub-op" hint — decode_zz_r narrows it: only
+                                          non-mul/div CB byte-ALU actually hangs)
+      D0..D7 → ('w', R16[r], True)        MIS-DECODE (kept as-is, fix pending): D0..D7
+                                          is really a WORD MEMORY-addressing family
+                                          (HW-confirmed 2026-07-03), not a word-register
+                                          prefix. It routes to decode_zz_mem in practice;
+                                          the word register-direct prefix is D8..DF.
+      D8..DF → ('w', R16[r], False)       WORD register (R16, WA…SP), safe — HW-confirmed
+                                          2026-07-03 (was wrongly R32/lword). The SAME
+                                          register appears at D8+r (word) and E8+r (long).
+      E8..EF → ('l', R32[r], False)       lword register (R32, XWA…XSP), safe
       C7     → ('b', None,   False)       extended bank-reg prefix, r=None sentinel
 
     Confirmed broken instructions on NGPC silicon (validated bisect 2026-03-22):
       CB xx → byte ALU using R8[3] = C as source. Example: `add A, C` = CB 81
               hangs in an infinite loop. Fix: route through HL — `add A, L` = CF 81.
-      D0..D7 xx → word ALU using R16 as source. Example: `cpl WA` = D0 06 hangs.
-                  Fix: extz XWA + use D8 (lword source) family.
+              NUANCE (hw_test_bytediv, real NGPC 2026-07-08): this is SUB-OP-SPECIFIC.
+              Byte MUL/DIV with C source (CB sub-op 0x40..0x5F; `CB 51` = `div A, C`)
+              EXECUTES and is CORRECT — it is NOT broken (used by retail mr_robot).
+              Only the non-mul/div CB byte-ALU sub-ops hang; decode_zz_r narrows the
+              warning accordingly.
+      D0..D7 xx → NOT word ALU. HW-confirmed 2026-07-03: D0..D7 is a WORD MEMORY family
+                  (e.g. `D0 B6 3F 50 00` = `cpw (0xB6),0x0050`), and its correct decode
+                  is an in-progress chantier. The word register-direct prefix is D8..DF.
+                  The 2026-05-20 `D0 C8` crash was the toolchain emitting D0 for an
+                  intended word-reg-immediate — but D0 is a memory mode — not a silicon bug.
 
     See module docstring for the LDC context asymmetry (D8 = R16 for LDC encoding
     but this function returns R32 — both naming conventions refer to the same bits).
     """
     if 0xC8 <= b <= 0xCF:
-        # CB specifically broken on silicon (CB family — byte ALU with C source).
-        # The other C8..CF variants are confirmed safe in CC900 production code.
+        # CB (byte ALU with C source) has a broken variant on silicon; the other
+        # C8..CF variants are confirmed safe in CC900 production code. The True
+        # here is a prefix-level "has a broken sub-op" hint — decode_zz_r narrows
+        # it: byte mul/div (CB sub-op 0x40..0x5F, e.g. `CB 51` = `div A, C`) is
+        # HW-cleared (hw_test_bytediv 2026-07-08), only the other CB byte-ALU hangs.
         return ('b', R8[b & 7], b == 0xCB)
     if 0xD0 <= b <= 0xD7:
-        return ('w', R16[b & 7], True)   # BROKEN on NGPC silicon (D0..D7 ALU prefix)
+        # MIS-DECODE (kept as-is; fix pending): D0..D7 is really a WORD MEMORY
+        # family (HW-confirmed 2026-07-03), not a word-register ALU prefix. In the
+        # live dispatch D0..D7 routes to decode_zz_mem (getmem<23), so this branch
+        # is effectively dead for the main path; the word-register-direct prefix
+        # is D8..DF. Left unchanged pending the D0..D7 memory re-decode chantier.
+        return ('w', R16[b & 7], True)
     if 0xD8 <= b <= 0xDF:
-        return ('l', R32[b & 7], False)  # ALU lword source — R32 (XWA…XSP)
+        return ('w', R16[b & 7], False)  # WORD source — R16 (WA…SP). HW-confirmed
+                                         # 2026-07-03: D8..DF is 16-bit word, NOT lword.
+                                         # (`D8 89` = `ld BC, WA`, high16 preserved.)
     if 0xE8 <= b <= 0xEF:
-        return ('l', R32[b & 7], False)  # E8 family: extz, LDIRW, etc.
+        return ('l', R32[b & 7], False)  # LONG source — R32 (XWA…XSP): the genuine
+                                         # 32-bit prefix (extz, LDIRW, link, etc.)
     # 0xC7 — extended bank register prefix; _getmem(0xC7)=23 routes here
     if b == 0xC7:
         return ('b', None, False)   # None = extended, next byte = bank_idx
+    # 0xE7 — LONG extended-register prefix (getr=0x07 -> reg code is the next
+    # byte, indexing the 256-entry r32 table; getzz=2=long). getmem(0xE7)=0x17
+    # routes here just like C7. The reg code is decoded per ngdis r32_names
+    # (e.g. 0x38 -> XDE3, bank 3). Used by the real SNK BIOS boot at 0xFF112F.
+    if b == 0xE7:
+        return ('l', None, False)
     return (None, None, False)
 
 def _imm_for_size(sz):
@@ -554,7 +599,18 @@ def decode_zz_r(data, pos, cur_addr, base):
     refs = []
     if broken:
         if b == 0xCB:
-            warn = '!BROKEN CB family (byte ALU C-source) — silicon hang, use CF (L-source) instead'
+            # NUANCE (hw_test_bytediv, real NGPC 2026-07-08): the CB "C-source
+            # byte-ALU" family is SUB-OP-SPECIFIC. `add A,C` (CB 81) IS a confirmed
+            # silicon hang (KEEP), but byte MUL/DIV (CB sub-op 0x40..0x5F; e.g.
+            # `CB 51` = `div A, C`) EXECUTES and is CORRECT on real hardware
+            # (WA=0x1F64 / C=0x64 -> WA=0x2450, quotient 0x50 remainder 0x24) and is
+            # used by retail mr_robot. This parallels the WORD mul/div clearing
+            # (D8..DF sub-op 0x40..0x5F, hw_test_muldiv 2026-07-06). So do NOT flag
+            # CB byte mul/div — only the non-mul/div CB byte-ALU sub-ops hang.
+            if 0x40 <= c <= 0x5F:
+                warn = None
+            else:
+                warn = '!BROKEN CB family (byte ALU C-source) — silicon hang, use CF (L-source) instead'
         else:
             warn = '!BROKEN D0..D7 ALU (word-reg prefix)'
     else:
@@ -600,6 +656,44 @@ def decode_zz_r(data, pos, cur_addr, base):
                                  f'{ext_reg}, {R8[c2 & 7]}', refs, warn)
         return (3, 'db', f'0x{b:02X}, 0x{bank_idx:02X}, 0x{c2:02X}', refs,
                 f'ext-reg bank{bank_num} op=0x{c2:02X}')
+
+    # ---- LONG extended-register prefix (0xE7) — next byte is the r32 code ----
+    if b == 0xE7:
+        if not _safe(data, pos, 3): return None
+        code = data[pos+1]
+        if code < 0x40 and (code & 3) == 0:            # banked XWA/XBC/XDE/XHL
+            ext_reg = f"X{('WA','BC','DE','HL')[(code >> 2) & 3]}{code >> 4}"
+        elif 0xE0 <= code and (code & 3) == 0:          # current-bank X-registers
+            ext_reg = ('XWA','XBC','XDE','XHL','XIX','XIY','XIZ','XSP')[(code - 0xE0) >> 2]
+        else:
+            ext_reg = f"?{code:02X}"
+        c2 = data[pos+2]
+        if c2 == 0x04: return (3, 'push', ext_reg, refs, warn)
+        if c2 == 0x05: return (3, 'pop',  ext_reg, refs, warn)
+        if c2 == 0x06: return (3, 'cpl',  ext_reg, refs, warn)
+        if c2 == 0x07: return (3, 'neg',  ext_reg, refs, warn)
+        if c2 == 0x10: return (3, 'daa',  ext_reg, refs, warn)
+        if c2 == 0x12: return (3, 'extz', ext_reg, refs, warn)
+        if c2 == 0x13: return (3, 'exts', ext_reg, refs, warn)
+        if c2 == 0x03:                                  # ld r32, imm32 (4-byte imm)
+            if not _safe(data, pos, 7): return None
+            imm = int.from_bytes(bytes(data[pos+3:pos+7]), 'little')
+            return (7, 'ld', f'{ext_reg}, 0x{imm:08X}', refs, warn)
+        if 0x60 <= c2 <= 0x67:
+            return (3, 'inc', f'{(c2 & 7) or 8}, {ext_reg}', refs, warn)
+        if 0x68 <= c2 <= 0x6F:
+            return (3, 'dec', f'{(c2 & 7) or 8}, {ext_reg}', refs, warn)
+        if 0xA8 <= c2 <= 0xAF:                          # ld r32, #3 (compact imm)
+            return (3, 'ld', f'{ext_reg}, {c2 & 7}', refs, warn)
+        if 0xC8 <= c2 <= 0xCF:                          # ALU r32, imm32
+            if not _safe(data, pos, 7): return None
+            imm = int.from_bytes(bytes(data[pos+3:pos+7]), 'little')
+            mnem = ('add','adc','sub','sbc','and','xor','or','cp')[c2 & 7]
+            return (7, mnem, f'{ext_reg}, 0x{imm:08X}', refs, warn)
+        if 0xD8 <= c2 <= 0xDF:                          # cp r32, #3
+            return (3, 'cp', f'{ext_reg}, {c2 & 7}', refs, warn)
+        return (3, 'db', f'0x{b:02X}, 0x{code:02X}, 0x{c2:02X}', refs,
+                f'ext-reg-long op=0x{c2:02X}')
 
     if reg is None:
         return None
@@ -657,10 +751,10 @@ def decode_zz_r(data, pos, cur_addr, base):
 
     if c == 0x2E:
         # LDC cr, r  (write CR) — encoding: [prefix][0x2E][cr_num]
-        # prefix: C8+r=ldcb(R8), D8+r=ldcw(R16→shown as R32 here), E8+r=ldcl(R32)
+        # prefix: C8+r=ldcb(R8), D8+r=ldcw(R16, shown as WA…SP), E8+r=ldcl(R32)
         # D0+r (broken!) was the old t900as.py bug (zz=0x08 → D0). Fixed: zz=0x10→D8, zz=0x20→E8.
         # CC900 uses: E8 2E cr for DMAS/DMAD (32-bit source/dest addr)
-        #             D8 2E cr for DMAC (16-bit count, displayed as XWA — see module docstring)
+        #             D8 2E cr for DMAC (16-bit count, displayed as WA — HW 2026-07-03: D8=word/R16)
         #             C9 2E cr for DMAM (8-bit mode, A register)
         if not _safe(data, pos, 3): return None
         cr = data[pos+2]
@@ -669,8 +763,10 @@ def decode_zz_r(data, pos, cur_addr, base):
 
     if c == 0x2F:
         # LDC r, cr  (read CR) — encoding: [prefix][0x2F][cr_num]
-        # Reads CR into register. D0 2F cr (read with R16/WA) is also broken on NGPC
-        # if D0 prefix is used. Safe: use ldcb for R8, or ldcl+extz for R32.
+        # Reads CR into register. For a word (R16/WA) CR read use the D8 word
+        # register-direct prefix — NOT D0 (D0..D7 is a WORD MEMORY family, not a
+        # register prefix; HW-confirmed 2026-07-03). Safe: ldcb for R8, ldcw (D8)
+        # for R16, or ldcl (E8) for R32.
         if not _safe(data, pos, 3): return None
         cr = data[pos+2]
         cr_nm = CR_NAMES.get(cr, f'CR_0x{cr:02X}')
@@ -729,20 +825,17 @@ def decode_zz_r(data, pos, cur_addr, base):
             if (mnem == 'adc' and sz == 'b'
                     and reg == 'B' and dest_reg(R_idx) == 'W'):
                 warn = '!BROKEN adc W,B fails when W>0 (silicon) — keep W==0 or restructure'
-            # D8..DF prefix + ALU r+r sub-op is silicon-broken on real NGPC
-            # except for the `cp r, r` exception (sub-op 0xF0..0xF7). Working-
-            # bank long-register ALU register-to-register family. HW evidence:
-            # `D8 8B` (= `ld XHL, XWA`) was emitted 114× in StarGunner before
-            # the toolchain shipped `_emit_copy_xwa_to_xhl` (byte-split
-            # `push WA; pop HL; add A,L; adc W,H`) on 2026-05-20 — first
-            # NgpCraft toolchain↔emulator payoff. Mirrors NgpCraft_emulator
-            # quirks_db.json `cpu.d8_df_register_to_register` v2026-05-20.v4.
-            elif 0xD8 <= b <= 0xDF and base_op != 0xF0:
-                warn = (
-                    f'!BROKEN D{b - 0xD0:X} {c:02X} = working-bank long-register '
-                    f'{mnem or "ld(reverse)"} r+r — use byte-split (push WA / pop HL / '
-                    f'add A,L / adc W,H) or the CP exception instead'
-                )
+            # NOTE (HW-confirmed 2026-07-03): D8..DF ALU r+r is a WORD (16-bit)
+            # operation on R16 and works correctly on real NGPC silicon — it is
+            # NOT broken. It was previously (incorrectly) flagged BROKEN under the
+            # belief that D8..DF was a 32-bit long-register prefix. Real-HW test:
+            # `D8 89` (= `ld BC, WA`) with XWA=0x11223344, XBC=0xAAAAAAAA yields
+            # XBC=0xAAAA3344 — a clean word copy (high16 preserved). The historical
+            # `_emit_copy_xwa_to_xhl` byte-split (toolchain, 2026-05-20) was needed
+            # because `D8 8B` is actually `ld HL, WA` (word, low16 only), NOT the
+            # 32-bit `ld XHL, XWA` copy the toolchain intended — the correct 32-bit
+            # copy uses the E8 (lword) prefix: `E8 8B` = `ld XHL, XWA`. So no warn
+            # is emitted here for D8..DF.
             if base_op == 0x98:
                 # LD r, R  (reverse direction)
                 return (2, 'ld', f'{reg}, {dest_reg(R_idx)}', refs, warn)
@@ -806,6 +899,12 @@ def decode_zz_r(data, pos, cur_addr, base):
 
     # ---- MUL/DIV (register form) — dest is one size wider than source ----
     # sz='b' → R16 dest, sz='w' → R32 dest (datasheet §5 MUL/DIV)
+    # HW-confirmed 2026-07-06 (test ROM hw_test_muldiv, real NGPC): the D8..DF
+    # WORD mul/div r+r family (0x40..0x5F; `D9 50` = `div WA, BC`) EXECUTES and is
+    # CORRECT — XWA=0x000003E8 / BC=0x000A → XWA=0x00000064 (quotient 100 + rem).
+    # It is NOT silicon-broken (earlier hang belief disproven; parallels the
+    # add r+r clearing of 2026-07-05). So no warn is emitted here — only shift-by-A
+    # (0xF8..0xFF) and the 0xB8..0xBF gap remain broken in the D8..DF family.
     def wide_reg(idx): return R16[idx] if sz == 'b' else R32[idx]
     if 0x40 <= c <= 0x47: return (2, 'mul',  f'{wide_reg(c & 7)}, {reg}', refs, warn)
     if 0x48 <= c <= 0x4F: return (2, 'muls', f'{wide_reg(c & 7)}, {reg}', refs, warn)
@@ -843,8 +942,12 @@ def decode_zz_r(data, pos, cur_addr, base):
 # Special hard-coded patterns (checked before general dispatch):
 #   0x84 0x10        → LDIW  (XDE+),(XHL+)  — single word copy (NGPC: XIY/XIX)
 #   0x95 0x11        → LDIRW (XDE+),(XHL+)  — repeat word copy (NGPC: XIY/XIX)
-#   0xD2..0xD5 LD    → safe CC900 abs-load patterns (tried before broken D0-D7 handler)
-#   0xD0..0xD7 other → broken D0..D7 ALU word-register prefix handler
+#   0xD2..0xD5 LD    → safe CC900 abs-load patterns (D0..D7 is a WORD MEMORY family)
+#   0xD0..0xD7 other → LEGACY word-reg-ALU-prefix handler (MIS-DECODE, fix pending):
+#                      HW-confirmed 2026-07-03 D0..D7 is a WORD MEMORY-addressing
+#                      family (e.g. `D0 B6 3F 50 00` = `cpw (0xB6),0x0050`), not a
+#                      word register-direct prefix (that is D8..DF). Correct memory
+#                      re-decode is an in-progress chantier; code left as-is for now.
 #   0xC1/0xD1/0xE1   → abs16 byte/word/lword loads (safe — these are mem forms, not ALU prefix)
 # ============================================================
 
@@ -886,8 +989,14 @@ def decode_zz_mem(data, pos, cur_addr, base):
                 return (n2+1, 'ld', f'{R16[r_idx2]}, {mem_str2}{ann2}', refs, warn)
 
     # ============================================================
-    # BROKEN word-reg ALU prefix (D0-D7) falling into decode_zz_mem path
-    # D0: all uses broken. D2-D5 ALU sub-ops also broken (non-load ops).
+    # LEGACY word-reg-ALU-prefix handler for D0..D7 (MIS-DECODE — fix pending).
+    # HW-confirmed 2026-07-03: D0..D7 is NOT a word-register ALU prefix; it is a
+    # WORD MEMORY-addressing family (e.g. `D0 B6 3F 50 00` = `cpw (0xB6),0x0050`).
+    # The word register-direct prefix is D8..DF. This handler still decodes the
+    # bytes as a word-reg prefix and is left AS-IS on purpose — the correct D0..D7
+    # memory re-decode is a large in-progress chantier tracked separately. The
+    # emitted "!BROKEN ... word-reg ALU prefix" strings below reflect the old
+    # (mis-diagnosed) framing and will be replaced when the re-decode lands.
     # ============================================================
     if 0xD0 <= b <= 0xD7 and b != 0xD1:
         warn = f'!BROKEN D{b-0xD0} word-reg ALU prefix (NGPC silicon bug)'
@@ -1440,13 +1549,15 @@ def decode_one(data, pos, cur_addr, base):
             if r: return r
         else:
             if mem >= 23:
-                # C8+zz+r: ALU on register, LINK/UNLK, LDC, shifts, bit ops
-                # Also handles broken D0..D7 (warn emitted via _zz_regs)
+                # C8+zz+r: ALU on register, LINK/UNLK, LDC, shifts, bit ops.
+                # Also the C7 (byte) and E7 (long) extended-register prefixes.
+                # (D0..D7 has mem<23 and routes to decode_zz_mem, not here.)
                 r = decode_zz_r(data, pos, cur_addr, base)
                 if r: return r
             elif mem <= 21:
-                # Indirect addressing: (r32), (r32+d8), (abs8/16/24), post-inc/pre-dec
-                # Also handles D0..D7 broken ALU prefix with inline warning
+                # Indirect addressing: (r32), (r32+d8), (abs8/16/24), post-inc/pre-dec.
+                # Also the legacy D0..D7 handler — currently mis-decoded as a word-reg
+                # ALU prefix (HW 2026-07-03: D0..D7 is a WORD MEMORY family; fix pending).
                 r = decode_zz_mem(data, pos, cur_addr, base)
                 if r: return r
 

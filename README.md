@@ -16,7 +16,7 @@ Implements the full TLCS-900/L1 instruction set from the official Toshiba TMP95C
 - **NGPC hardware register annotations** — joypad, VBlank vector, watchdog, K2GE, sprite VRAM, scroll planes, tile RAM
 - **BIOS SWI names** — `swi 1` → `BIOS_CLOCKGEARSET`, `swi 5` → `BIOS_SYSFONTSET`, etc.
 - **DMA LDC register names** — `DMAC0`, `DMAS0`, `DMAD0`, `DMAM1`…
-- **Broken opcode detection** — `D0` prefix, `CB` family (`add A, C` and friends), `LINK XIY, N≥5`, and `adc W, B` (silent wrong result when W>0) all flagged `; !BROKEN <reason — fix>` inline. The CB and `adc W, B` flags were wired up in 2026-04 to match the README's claims.
+- **Broken opcode detection** — `CB` byte-ALU sub-ops (`add A, C` and friends — but **not** the byte mul/div sub-ops `CB 0x40..0x5F`, e.g. `CB 51` = `div A, C`, which are HW-cleared per `hw_test_bytediv` 2026-07-08), `LINK XIY, N≥5`, and `adc W, B` (silent wrong result when W>0) all flagged `; !BROKEN <reason — fix>` inline. The CB and `adc W, B` flags were wired up in 2026-04 to match the README's claims. (Note: the `D0..D7` prefix is *also* flagged `!BROKEN`, but that is a **known mis-decode, not a silicon defect** — HW-confirmed 2026-07-03, `D0..D7` is a WORD MEMORY-addressing family; the word register-direct prefix is `D8..DF`. The correct D0..D7 memory re-decode is in progress.)
 - **Two-pass label resolution** — `entry_point:`, `sub_2XXXXX:` (call targets), `loc_2XXXXX:` (jump targets) with `; -> sub_XXXXXX` cross-references on every call/jump
 - **Auto ROM header parsing** — detects title, entry point, color/mono, software ID from the 64-byte SNK header
 

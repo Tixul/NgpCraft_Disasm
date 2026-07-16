@@ -177,24 +177,34 @@ Any instruction that references a known NGPC hardware address is annotated autom
 Instructions that are **known to crash or hang on NGPC silicon** are annotated with `; !BROKEN`:
 
 ```asm
-0x200100: D0 61    inc   8, WA    ; !BROKEN D0..D7 ALU (word-reg prefix)
+0x200100: D0 61    inc   8, WA    ; !BROKEN D0 word-reg ALU prefix (NGPC silicon bug)
 ```
+
+> **Correction (HW-confirmed 2026-07-03):** the `D0..D7` annotation above is a **known
+> mis-decode, pending fix**. `D0..D7` is **not** a word register-direct prefix and is **not**
+> silicon-broken — it is a **WORD MEMORY-addressing family** (e.g. `D0 B6 3F 50 00` =
+> `cpw (0xB6),0x0050`). The word register-direct prefix is `D8..DF`. The disassembler still
+> emits the legacy `!BROKEN … word-reg ALU prefix` warning for `D0..D7` because the correct
+> memory re-decode is a large in-progress chantier; treat that warning as "mis-decoded here",
+> not "broken silicon". See the D0..D7 rows below.
 
 ### Known broken opcodes on NGPC silicon
 
 | Opcode(s) | Issue | Suggested fix |
 |-----------|-------|---------------|
-| `D0 xx` | D0 prefix (all sub-ops) — hangs watchdog | Use D8 (R32) family, e.g. `extz xwa; sll N, xwa` instead of `sll N, wa` |
-| `D0 C8..CF lo hi` (ALU-imm `<alu> WA, imm16`) | **HW crash confirmed 2026-05-20** on `stargunner_j16_C4_phase4_BROKEN_HW_20260520.ngc`. The earlier "safe-second-range 0xC8..0xCF" classification was wrong; CC900 emits 0 instances of this family in `f_code`. | Byte-split: `ld HL, imm; <alu> A, L; <carry> W, H` (the CC900 pattern, used for 25+ years) |
-| `D1..D7 xx` (ALU sub-ops) | Word-register ALU — broken (but D1/D2-D5 as abs-address loads are **safe**) | Switch to byte (C8..CF) or lword (D8..DF / E8..EF) source |
-| `D8..DF` ALU r+r (sub-ops `0x80..0xEF`, except `cp r,r` `0xF0..0xF7`) | Working-bank long-register ALU register-to-register **broken on silicon**. First payoff of the toolchain↔emulator loop: `D8 8B` (= `ld XHL, XWA`) was emitted 114× in StarGunner before the toolchain shipped `_emit_copy_xwa_to_xhl` (2026-05-20) | Byte-split via stack: `push WA; pop HL; add A,L; adc W,H` for `ld XHL, XWA`-style copies. The `cp r,r` exception (`0xF0..0xF7`) remains safe. |
-| `CB xx` | Byte ALU using R8[3]=C as source. `add A, C` (CB 81) hangs | Route through HL: `add A, L` (CF 81). Other byte-ALU prefixes (C8 W, C9 A, CA B, CC D, CD E, CE H, CF L) are confirmed safe |
+| `D0..D7` (currently flagged) | **MIS-DECODE, not silicon-broken** (HW-confirmed 2026-07-03). `D0..D7` is a **WORD MEMORY-addressing family** (e.g. `D0 B6 3F 50 00` = `cpw (0xB6),0x0050`), not a word register-direct prefix (that is `D8..DF`). The disassembler still emits `!BROKEN … word-reg ALU prefix` here pending the D0..D7 memory re-decode. | No silicon workaround needed. For a word register-immediate ALU op use the byte-split CC900 pattern; for word register-direct moves use `D8..DF`. |
+| `D0 C8..CF lo hi` (2026-05-20 crash) | The `stargunner_j16_C4_phase4_BROKEN_HW_20260520.ngc` **HW crash on 2026-05-20 was real**, but its cause was a toolchain **mis-emission**: it emitted `D0` intending a word-register-immediate (`<alu> WA, imm16`) — however `D0` is a **memory-addressing mode**, so the bytes executed as garbage. This is a code-generation bug, **not** a silicon defect. CC900 emits 0 instances of `<alu> WA, imm` and instead byte-splits. | Byte-split: `ld HL, imm; <alu> A, L; <carry> W, H` (the CC900 pattern, used for 25+ years) |
+| `CB xx` (non-mul/div sub-ops) | Byte ALU using R8[3]=C as source. `add A, C` (CB 81) hangs. **SUB-OP-SPECIFIC:** only the byte-ALU sub-ops hang — byte **MUL/DIV** with C source (`CB` sub-op `0x40..0x5F`, e.g. `CB 51` = `div A, C`) is **HW-cleared, not broken** (see correction note below). | Route through HL: `add A, L` (CF 81). Other byte-ALU prefixes (C8 W, C9 A, CA B, CC D, CD E, CE H, CF L) are confirmed safe |
 | `LINK XIY, N` where N≥5 | Stack frame too large — corrupts SP | Use `link XIY, 0` then `add XSP, -N` to allocate locals |
 | `adc W, B` when W > 0 | High-byte add produces wrong result silently | Keep W=0 (count ≤ 255) or split the add manually |
 
-> **Note:** `D1` as abs16 load (`LD R16, (abs16)`) and `D2–D5` used as abs-address memory loads (`LD R16, (abs24)`, `LD R16, (r32)`, etc.) are **safe** and decode normally without a warning. The CB warning fires only on prefix `0xCB` specifically; the surrounding C8..CF family (W/A/B/D/E/H/L sources) is confirmed safe by CC900 production code.
+> **Note:** `D1` as abs16 load (`LD R16, (abs16)`) and `D2–D5` used as abs-address memory loads (`LD R16, (abs24)`, `LD R16, (r32)`, etc.) are **safe** and decode normally without a warning. The CB warning fires only on prefix `0xCB` **and only for its byte-ALU sub-ops** — the byte mul/div sub-ops (`0x40..0x5F`, e.g. `CB 51` = `div A, C`) decode without a warning (HW-cleared, see the correction note below). The surrounding C8..CF family (W/A/B/D/E/H/L sources) is confirmed safe by CC900 production code.
 
-> **Synchronisation:** the broken-set above mirrors the NgpCraft toolchain's hardware-validation history (`stargunner_j16_C4_phase4*` test ROMs) and the NgpCraft_emulator `core/quirks_db.json` `2026-05-20.v4` entries `cpu.d0_d7_non_immediate`, `cpu.d8_df_register_to_register`, `cpu.link_xiy_large_frame`. When the toolchain or emulator quirk database bumps, this table is the resync target.
+> **Correction (HW-confirmed 2026-07-08):** the **byte** mul/div register-to-register sub-family (`CB` sub-op `0x40..0x5F`; canonical `CB 51` = `div A, C`) is **not broken** — test ROM `hw_test_bytediv` on a real NGPC: `div A, C` with `WA=0x1F64`, `C=0x64` produced `WA=0x2450` (quotient `0x50`, remainder `0x24`), and the instruction is used by retail `mr_robot`. This narrows the `CB xx` broken-set: **only `add A, C` (CB 81) and the other non-mul/div CB byte-ALU sub-ops hang**; the byte mul/div sub-ops are HW-cleared, paralleling the WORD mul/div clearing (`D8..DF` sub-op `0x40..0x5F`, `hw_test_muldiv` 2026-07-06). The decoder still decodes these bytes as `div A, C`/`mul`/`divs`; only the `!BROKEN` annotation was narrowed.
+
+> **Correction (HW-confirmed 2026-07-03):** `D8..DF` is a **16-bit WORD** register prefix (`R16`, WA…SP), **not** a 32-bit long-register prefix, and its ALU register-to-register forms are **not broken** — so `D8..DF` no longer appears in this table. Real-hardware test on a flashed NGPC ROM: `D8 89` (= `ld BC, WA`) with `XWA=0x11223344`, `XBC=0xAAAAAAAA` produced `XBC=0xAAAA3344` — a clean word copy (high 16 bits preserved); `D9 1C` (= `djnz BC`) with `XBC=0x00020000` produced `XBC=0x0002FFFF` (word decrement). The genuine 32-bit long prefix is `E8..EF` (`E8 89` = `ld XBC, XWA`). The earlier "broken working-bank long-register" belief was a size-classification error: `D8 8B` was read as the 32-bit `ld XHL, XWA` but is really the 16-bit `ld HL, WA`, which is why the toolchain's `_emit_copy_xwa_to_xhl` byte-split (2026-05-20) appeared necessary — the correct 32-bit copy is simply `E8 8B`. **The mul/div register-to-register sub-family (`D8..DF` sub-op `0x40..0x5F`; canonical `D9 50` = `div WA, BC`) is likewise HW-confirmed *not* broken** — test ROM `hw_test_muldiv` on a real NGPC (2026-07-06): `div WA, BC` with `XWA=0x000003E8`, `BC=0x000A` produced `XWA=0x00000064` (quotient 100 + remainder), disproving the old silicon-hang belief and paralleling the `add r+r` clearing (2026-07-05). Within the `D8..DF` word prefix family only **shift-by-A (`0xF8..0xFF`)** and the **`0xB8..0xBF` gap** remain silicon-broken.
+
+> **Synchronisation:** the broken-set above mirrors the NgpCraft toolchain's hardware-validation history (`stargunner_j16_C4_phase4*` test ROMs) and the NgpCraft_emulator `core/quirks_db.json` `cpu.d0_d7_non_immediate` and `cpu.link_xiy_large_frame` entries. (The former `cpu.d8_df_register_to_register` quirk was retired 2026-07-03 once real hardware proved `D8..DF` is a working 16-bit word prefix — see the correction note above.) When the toolchain or emulator quirk database bumps, this table is the resync target.
 
 > **About the `adc W, B` warning:** static disassembly cannot know the runtime value of `W`. The flag is unconditional — the reader is expected to verify intent. A safe `adc W, B` with `W==0` will still be flagged.
 
@@ -223,6 +233,7 @@ The decoder handles the full TLCS-900/L1 instruction set as documented in the TM
 | Multiply/Divide | `MUL RR, r` / `MUL RR, #imm`, `MULS`, `DIV`, `DIVS` (register and immediate forms) |
 | RLD/RRD | Rotate BCD digit through accumulator |
 | LDC | `LDC cr, r` / `LDC r, cr` — DMA registers annotated (`DMAC0`, `DMAS0`, `DMAD0`, `DMAM0`…) |
+| Extended-register prefixes | `0xC7` = **byte** extended/banked-register prefix (e.g. `rA2`, `rW3`); `0xE7` = **long** extended-register prefix — its reg code indexes the `r32` table (`0x00..0x3F` = banked `XWA0..XHL3`, `0xE0..0xFF` = current-bank `XWA..XSP`). Both cover `push`/`pop`/`cpl`/`neg`/`extz`/`exts`/`daa`, `inc/dec #n`, `ld r,#3`, `cp r,#3`, `ld r,imm` and ALU-imm `add/adc/sub/sbc/and/xor/or/cp`. Example: `E7 38 A8` = `ld XDE3, 0`; `E7 E0 04` = `push XWA`. Used by the SNK BIOS boot. |
 
 ---
 
@@ -311,7 +322,7 @@ The NGPC BIOS occupies `0xFF0000–0xFFFFFF` (64 KB).
 
 - **Linear sweep only** — no recursive descent. Data sections embedded in code may confuse the decoder.
 - **No symbol import** — labels are auto-generated (`sub_XXXXXX`, `loc_XXXXXX`). No way to import a symbol table.
-- **D0 family** — decoded for annotation purposes but always flagged as BROKEN (correct behavior for NGPC silicon).
+- **D0..D7 family** — currently mis-decoded as a word-register ALU prefix and flagged `!BROKEN`. HW-confirmed 2026-07-03: `D0..D7` is actually a **WORD MEMORY-addressing family** (the word register-direct prefix is `D8..DF`), so the `!BROKEN` annotation is a **mis-decode marker, not a silicon-defect claim**. The correct memory re-decode is an in-progress chantier.
 - **ARI mode 3 complex forms** — decoded when r32 index is in valid range; invalid combinations (which are data bytes) fall back to `db`.
 - **Undefined opcodes** — slots that are blank in the datasheet Appendix C instruction map (e.g., `0x58–0x5F` in the `b < 0x80` range) are emitted as `db`.
 
