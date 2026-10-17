@@ -1579,7 +1579,8 @@ def parse_header(data):
     licensed = (copyright_s[0:1] == b' ')
     entry    = u32(data, 0x1C) if len(data) >= 0x20 else ROM_BASE + HEADER_SIZE
     sw_id    = u16(data, 0x20) if len(data) >= 0x22 else 0
-    color    = (data[0x22] == 0x10) if len(data) >= 0x23 else False
+    # 0x22 = sub-code / version ; 0x23 = compatible system (0x10 = color)
+    color    = (data[0x23] == 0x10) if len(data) >= 0x24 else False
     title    = data[0x24:0x30].rstrip(b' \x00').decode('ascii', errors='replace')
     return {
         'licensed': licensed,
